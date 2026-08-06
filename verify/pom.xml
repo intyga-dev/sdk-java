@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.intyga</groupId>
+  <artifactId>intyga-verify</artifactId>
+  <version>0.1.0</version>
+  <packaging>jar</packaging>
+
+  <name>intyga-verify</name>
+  <description>Offline verifier for Intyga approval receipts and DEWP audit proofs (Core Profile) — no Intyga secret, no network</description>
+  <url>https://www.intyga.com</url>
+  <licenses>
+    <license>
+      <name>Apache-2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0</url>
+    </license>
+  </licenses>
+  <scm>
+    <url>https://github.com/intyga-dev/verify-java</url>
+  </scm>
+
+  <properties>
+    <maven.compiler.release>17</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+  </properties>
+
+  <dependencies>
+    <!-- The ONLY runtime dependency: Java has no stdlib JSON. Used tree-model + own-final-records
+         only; polymorphic default typing (the CVE surface) is never enabled. All cryptography is
+         the JDK's own (SHA-256, P-256 ECDSA) — no crypto dependency at all. -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>2.22.1</version>
+    </dependency>
+    <!-- JUnit 6 runs on JUnit Platform 6, which only Surefire 3.5.3+ can launch — an older Surefire
+         discovers zero tests and still reports the build green. The two versions below MUST move
+         together; see the Surefire comment. -->
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>6.1.2</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.15.0</version>
+      </plugin>
+      <!-- Pinned NOT cosmetically: Maven's super-POM binds surefire 2.12.4, which discovers zero
+           JUnit tests and reports the build green — for a verifier pinned by golden vectors that
+           is the worst possible failure mode. The same trap applies to the JUnit 5→6 move: keep
+           this at 3.5.3+ so Platform 6 is actually launched, and if you ever downgrade one of the
+           two, check the run reported a non-zero test count rather than trusting the exit code. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.5.6</version>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.5.1</version>
+        <configuration>
+          <archive>
+            <manifestEntries>
+              <Automatic-Module-Name>com.intyga.verify</Automatic-Module-Name>
+            </manifestEntries>
+          </archive>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>
