@@ -12,7 +12,7 @@ One runtime dependency (Jackson, for JSON — Java has no stdlib JSON). All cryp
 <dependency>
   <groupId>com.intyga</groupId>
   <artifactId>intyga-verify</artifactId>
-  <version>0.1.0</version>
+  <version>1.0.0</version>
 </dependency>
 ```
 

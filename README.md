@@ -14,11 +14,11 @@ Runtime dependencies: `com.intyga:intyga-verify` and Jackson (`jackson-databind`
 <dependency>
   <groupId>com.intyga</groupId>
   <artifactId>intyga-sdk</artifactId>
-  <version>0.1.0</version>
+  <version>1.0.0</version>
 </dependency>
 ```
 
-Gradle: `implementation("com.intyga:intyga-sdk:0.1.0")` (with `mavenLocal()` until the package is published).
+Gradle: `implementation("com.intyga:intyga-sdk:1.0.0")` (with `mavenLocal()` until the package is published).
 
 ## Require a human approval before a high-risk action
 

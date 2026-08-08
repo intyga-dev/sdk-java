@@ -5,7 +5,7 @@ All notable changes to `com.intyga:intyga-sdk` are documented here. The format f
 
 ## [Unreleased]
 
-## [0.1.0]
+## [1.0.0]
 
 Initial public release.
 

@@ -6,7 +6,7 @@
 
   <groupId>com.intyga</groupId>
   <artifactId>intyga-sdk</artifactId>
-  <version>0.1.0</version>
+  <version>1.0.0</version>
   <packaging>jar</packaging>
 
   <name>intyga-sdk</name>
@@ -38,7 +38,7 @@
     <dependency>
       <groupId>com.intyga</groupId>
       <artifactId>intyga-verify</artifactId>
-      <version>0.1.0</version>
+      <version>1.0.0</version>
     </dependency>
     <!-- Java has no stdlib JSON. Databind is used tree-model and own-final-records only;
          polymorphic default typing (the CVE surface) is never enabled. HTTP is the JDK's built-in
