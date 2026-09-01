@@ -59,6 +59,19 @@ public final class Canonical {
     if (v instanceof Integer || v instanceof Long || v instanceof Short || v instanceof Byte) {
       return portableLong(((Number) v).longValue());
     }
+    if (v instanceof BigDecimal bd) {
+      // Reached when a caller's mapper is configured with USE_BIG_DECIMAL_FOR_FLOATS, or the params
+      // map was hand-built. The canonical form is defined over the IEEE-754 double every other port
+      // parses into, so the value is accepted only when the shortest form of that double reads back
+      // as the SAME number — otherwise Java would emit digits no other port could reproduce.
+      double d = bd.doubleValue();
+      String out = stableStringify(d);
+      if (new BigDecimal(out).compareTo(bd) != 0) {
+        throw new NonPortableValueException(
+            bd + " carries more precision than a double, so it does not canonicalize portably");
+      }
+      return out;
+    }
     if (v instanceof BigInteger bi) {
       // Jackson yields BigInteger only beyond long range, which is far outside the portable bound.
       if (bi.abs().compareTo(BigInteger.valueOf((long) 1e16)) >= 0) {
@@ -200,6 +213,18 @@ public final class Canonical {
     return exact.toPlainString();
   }
 
+  /**
+   * UTF-16 code-unit order over a set element, with a JSON null sorted as the text {@code "null"}.
+   *
+   * <p>These lists arrive from attacker-supplied JSON and Jackson maps a null inside one to a null
+   * ELEMENT, which {@code String::compareTo} throws on — an exception escaping a verifier documented
+   * to RETURN a refusal. Sorting it as "null" is what the TS reference's default comparator does
+   * ({@code String(null)}), so a non-conformant list still canonicalizes to identical bytes.
+   */
+  private static int compareSortable(String a, String b) {
+    return (a == null ? "null" : a).compareTo(b == null ? "null" : b);
+  }
+
   private static String nz(String s) {
     return s == null ? "" : s;
   }
@@ -228,7 +253,7 @@ public final class Canonical {
         requirement.allowedAaguids() == null
             ? new ArrayList<>()
             : new ArrayList<>(requirement.allowedAaguids());
-    aaguids.sort(String::compareTo);
+    aaguids.sort(Canonical::compareSortable);
 
     Map<String, Object> req = new LinkedHashMap<>();
     req.put("did", nz(requester.did()));
@@ -326,7 +351,7 @@ public final class Canonical {
       String expiresAt) {
     Map<String, Object>[] common = canonicalCommon(requester, requirement);
     List<String> delegates = delegatedTo == null ? new ArrayList<>() : new ArrayList<>(delegatedTo);
-    delegates.sort(String::compareTo);
+    delegates.sort(Canonical::compareSortable);
     Map<String, Object> obj = new LinkedHashMap<>();
     obj.put("v", Div.VERSION);
     obj.put("type", Div.DELEGATION_TYPE);

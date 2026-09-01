@@ -17,6 +17,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -169,15 +170,200 @@ class IntygaClientTest {
               ("Basic " + expectedBasic)
                   .equals(exchange.getRequestHeaders().getFirst("Authorization")),
               "token: wrong basic auth header");
+          // No expires_in at all: a gateway or proxy that omits it must not NPE the exchange, and
+          // the token is then served until a 401 evicts it — however far the clock moves.
           respond(exchange, 200, "{\"access_token\":\"tok_exchanged\"}");
+        });
+
+    AtomicLong clock = new AtomicLong();
+    IntygaClient client =
+        IntygaClient.builder()
+            .gatewayUrl(baseUrl())
+            .clientId("cid")
+            .clientSecret("secret")
+            .nanoClock(clock::get)
+            .build();
+
+    assertEquals("tok_exchanged", client.token());
+    assertEquals("tok_exchanged", client.token());
+    clock.addAndGet(Duration.ofDays(30).toNanos());
+    assertEquals("tok_exchanged", client.token());
+    assertEquals(1, exchanges.get(), "token() must serve the cache when no expiry is known");
+    assertNoViolations();
+  }
+
+  @Test
+  void tokenIsReExchangedBeforeExpiry() {
+    AtomicInteger exchanges = new AtomicInteger();
+    server.createContext(
+        "/oauth/token",
+        exchange ->
+            respond(
+                exchange,
+                200,
+                "{\"access_token\":\"tok_"
+                    + exchanges.incrementAndGet()
+                    + "\",\"expires_in\":100}"));
+
+    AtomicLong clock = new AtomicLong(Duration.ofHours(1).toNanos());
+    IntygaClient client =
+        IntygaClient.builder()
+            .gatewayUrl(baseUrl())
+            .clientId("cid")
+            .clientSecret("secret")
+            .nanoClock(clock::get)
+            .build();
+
+    assertEquals("tok_1", client.token());
+    // expires_in 100 → margin min(60, 10) = 10s → refresh at 90s. Just inside: still cached.
+    clock.addAndGet(Duration.ofSeconds(89).toNanos());
+    assertEquals("tok_1", client.token());
+    assertEquals(1, exchanges.get(), "must not re-exchange inside the refresh margin");
+    // At the margin: re-exchanged, well before the token actually expires at 100s.
+    clock.addAndGet(Duration.ofSeconds(1).toNanos());
+    assertEquals("tok_2", client.token());
+    assertEquals("tok_2", client.token());
+    assertEquals(2, exchanges.get(), "exactly one re-exchange at the refresh margin");
+    assertNoViolations();
+  }
+
+  @Test
+  void refreshMarginIsCappedAtSixtySeconds() {
+    AtomicInteger exchanges = new AtomicInteger();
+    server.createContext(
+        "/oauth/token",
+        exchange ->
+            respond(
+                exchange,
+                200,
+                "{\"access_token\":\"tok_"
+                    + exchanges.incrementAndGet()
+                    + "\",\"expires_in\":900}"));
+
+    AtomicLong clock = new AtomicLong();
+    IntygaClient client =
+        IntygaClient.builder()
+            .gatewayUrl(baseUrl())
+            .clientId("cid")
+            .clientSecret("secret")
+            .nanoClock(clock::get)
+            .build();
+
+    assertEquals("tok_1", client.token());
+    // 900/10 = 90s would refresh at 810s; the cap of 60s means 840s. Pin the cap, not the tenth.
+    clock.addAndGet(Duration.ofSeconds(839).toNanos());
+    assertEquals("tok_1", client.token());
+    clock.addAndGet(Duration.ofSeconds(1).toNanos());
+    assertEquals("tok_2", client.token());
+    assertEquals(2, exchanges.get());
+    assertNoViolations();
+  }
+
+  @Test
+  void unauthorizedOnExchangedTokenRetriesOnceWithFreshExchange() {
+    AtomicInteger exchanges = new AtomicInteger();
+    AtomicInteger authorizeCalls = new AtomicInteger();
+    server.createContext(
+        "/oauth/token",
+        exchange ->
+            respond(
+                exchange,
+                200,
+                "{\"access_token\":\"tok_"
+                    + exchanges.incrementAndGet()
+                    + "\",\"expires_in\":3600}"));
+    server.createContext(
+        "/authorize",
+        exchange -> {
+          int call = authorizeCalls.incrementAndGet();
+          String auth = exchange.getRequestHeaders().getFirst("Authorization");
+          if (call == 1) {
+            // The gateway's clock says the first token is already dead (skew, a shortened TTL).
+            expect("Bearer tok_1".equals(auth), "first authorize must carry the first exchange");
+            respond(exchange, 401, "{\"error\":\"Invalid token: ERR_JWT_EXPIRED\"}");
+          } else {
+            expect(
+                "Bearer tok_2".equals(auth), "retry must carry a FRESH exchange, not the old one");
+            respond(exchange, 200, "{\"nonce\":\"n_retry\",\"status\":\"PENDING\"}");
+          }
         });
 
     IntygaClient client =
         IntygaClient.builder().gatewayUrl(baseUrl()).clientId("cid").clientSecret("secret").build();
+    AuthorizeResponse r = client.authorize("x", wipeOptions());
 
-    assertEquals("tok_exchanged", client.token());
-    assertEquals("tok_exchanged", client.token());
-    assertEquals(1, exchanges.get(), "second token() call must serve the cache");
+    assertEquals("n_retry", r.nonce());
+    assertEquals(2, exchanges.get(), "401 must evict the cache and exchange again");
+    assertEquals(2, authorizeCalls.get(), "the refused call is retried once");
+    assertNoViolations();
+  }
+
+  @Test
+  void persistentUnauthorizedIsRetriedExactlyOnceThenThrown() {
+    AtomicInteger exchanges = new AtomicInteger();
+    AtomicInteger authorizeCalls = new AtomicInteger();
+    server.createContext(
+        "/oauth/token",
+        exchange ->
+            respond(
+                exchange,
+                200,
+                "{\"access_token\":\"tok_"
+                    + exchanges.incrementAndGet()
+                    + "\",\"expires_in\":900}"));
+    server.createContext(
+        "/authorize",
+        exchange -> {
+          authorizeCalls.incrementAndGet();
+          respond(exchange, 401, "{\"error\":\"revoked\"}");
+        });
+
+    IntygaClient client =
+        IntygaClient.builder().gatewayUrl(baseUrl()).clientId("cid").clientSecret("secret").build();
+    GatewayRefusedException refused =
+        assertThrows(GatewayRefusedException.class, () -> client.authorize("x", wipeOptions()));
+
+    // A revoked key must surface as the refusal it is, not loop: one retry, then the 401 is thrown.
+    assertEquals(401, refused.status());
+    assertEquals(2, authorizeCalls.get(), "exactly one retry");
+    assertEquals(2, exchanges.get(), "exactly one re-exchange");
+    assertNoViolations();
+  }
+
+  @Test
+  void explicitTokenIsNeverReExchanged() {
+    AtomicInteger exchanges = new AtomicInteger();
+    AtomicInteger authorizeCalls = new AtomicInteger();
+    server.createContext(
+        "/oauth/token",
+        exchange -> {
+          exchanges.incrementAndGet();
+          respond(exchange, 200, "{\"access_token\":\"tok_never\",\"expires_in\":900}");
+        });
+    server.createContext(
+        "/authorize",
+        exchange -> {
+          authorizeCalls.incrementAndGet();
+          expect(
+              "Bearer preminted".equals(exchange.getRequestHeaders().getFirst("Authorization")),
+              "explicit token must be sent as given");
+          respond(exchange, 401, "{\"error\":\"Invalid token: ERR_JWT_EXPIRED\"}");
+        });
+
+    IntygaClient client =
+        IntygaClient.builder()
+            .gatewayUrl(baseUrl())
+            .token("preminted")
+            // Credentials present too: they must still be ignored when an explicit token is set.
+            .clientId("cid")
+            .clientSecret("secret")
+            .build();
+    GatewayRefusedException refused =
+        assertThrows(GatewayRefusedException.class, () -> client.authorize("x", wipeOptions()));
+
+    assertEquals(401, refused.status());
+    assertEquals(0, exchanges.get(), "there is nothing to re-exchange behind an explicit token");
+    assertEquals(1, authorizeCalls.get(), "an explicit token is not retried");
     assertNoViolations();
   }
 

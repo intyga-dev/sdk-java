@@ -2,7 +2,7 @@
 
 Independently confirm that a human cryptographically approved **exactly** the action you are about to run — in your own process, with no Intyga secret and no network call. You recompute the canonical payload from your own parameters, check it byte-matches what was signed, and verify the human's **ES256** or **WebAuthn** signature.
 
-One runtime dependency (Jackson, for JSON — Java has no stdlib JSON). All cryptography is the JDK's own: SHA-256 and P-256 ECDSA, no crypto library. Its canonicalization is held byte-identical to the TypeScript, Python, Go and Rust verifiers by the shared cross-language test vectors in `packages/mcp-schemas/vectors/`.
+Java 17 or newer. One declared runtime dependency — `jackson-databind`, for JSON, since Java has no stdlib JSON — which brings `jackson-core` and `jackson-annotations` transitively, so three jars in total. All cryptography is the JDK's own: SHA-256 and P-256 ECDSA, no crypto library. Its canonicalization is held byte-identical to the TypeScript, Python, Go and Rust verifiers by the shared cross-language test vectors in `packages/mcp-schemas/vectors/`.
 
 > Status: **not yet published** to Maven Central. Build it locally with `mvn install` in this directory.
 
@@ -44,9 +44,11 @@ if (!res.ok()) {
 
 A receipt arrives from the client as raw JSON; `ApprovalReceipt.parse(...)` accepts either a `String` or the `JsonNode` that `com.intyga.sdk.ApprovalResult.receipt()` returns.
 
-**One-approver-per-key caveat.** In public-keys mode the identity IS the key, so an M-of-N quorum counts credentials, not people: one approver whose two registered credentials are both listed satisfies a 2-of-N alone. For `requiredApprovals` > 1 use the DID/identity form (`ApproverTrustAnchor.ofDidsMultiKey`), which counts distinct approvers (DIV §4.4.6).
+**One-approver-per-key caveat.** In public-keys mode the identity IS the key, so an M-of-N quorum counts credentials, not people: one approver whose two registered credentials are both listed satisfies a 2-of-N alone. The same limitation weakens `requesterCannotApprove`: the witness's `signerDid` is an unverified string in this mode, so a requester holding a listed key can evade the four-eyes exclusion by naming a different `signerDid`. For `requiredApprovals` > 1 — or whenever four-eyes matters — use the DID/identity form (`ApproverTrustAnchor.ofDidsMultiKey`), which counts distinct approvers (DIV §4.4.6). Delegation verification goes further and **refuses** a public-keys anchor outright — see below.
 
 One byte of drift — a swapped target, an appended region — and verification fails, because the signature was over the exact bytes you just recomputed.
+
+**Refusals that are the design, not a bug.** A receipt whose signed `requirement.signerClass` is absent, or is anything other than `human`, is refused (DIV §4.3.2): `human` is the only class defined today, and a verifier that treated an unrecognized one as human-approved would be the failure mode the registry exists to prevent. A deployed verifier refusing a class it predates is the intended migration path for the future delegated-agent work. A signed `requiredApprovals` below 1 is refused for the same fail-closed reason — "at least 0" is satisfied by counting nothing.
 
 ## WebAuthn (passkey) receipts
 
@@ -63,7 +65,9 @@ VerifyOptions opts = VerifyOptions.builder()
 
 ## Offline approvals and delegations
 
-`Verify.verifyDelegation(...)` checks a DIV §5a.5 delegation — a statement, signed in advance by the ordinary quorum, naming local operators who may approve one pre-declared action while the gateway is unreachable. It is a separate method because a delegation authorizes nothing on its own: `verifyApprovalReceipt` refuses that payload type outright, with no opt-in. Pass the resulting `VerifiedDelegation` as `VerifyOptions.delegation(...)` together with `allowOffline(true)` when verifying the offline approval the delegated operators signed. The 60-minute offline window and 72-hour delegation window are enforced here, not merely at mint.
+`Verify.verifyDelegation(...)` checks a DIV §5a.5 delegation — a statement, signed in advance by the ordinary quorum, naming local operators who may approve one pre-declared action while the gateway is unreachable. It is a separate method because a delegation authorizes nothing on its own: `verifyApprovalReceipt` refuses that payload type outright, with no opt-in. Pass the resulting `VerifiedDelegation` as `VerifyOptions.delegation(...)` together with `allowOffline(true)` when verifying the offline approval the delegated operators signed. The 60-minute offline window and 72-hour delegation window are enforced here, not merely at mint, and neither may be dated in the future.
+
+`verifyDelegation` requires a **DID-mode** trust anchor (`ApproverTrustAnchor.ofDids` / `ofDidsMultiKey`) and refuses a public-keys anchor at seal verification, whatever the quorum size: the sealing quorum names people, and a key set cannot associate identities (DIV §4.4.6). Every port refuses this identically.
 
 ## DEWP conformance
 
@@ -77,6 +81,8 @@ It does **not** implement, and a caller should not assume:
 - **The §5.4 checkpoint continuity chain (`0x04` domain tag).** Roots-file transport, outside Core (DEWP §9.1); implemented by the TypeScript verifier only.
 - **DIV §4.4.4 verification-code derivation.** The short display code is a human-factors aid that MUST NOT be treated as authentication, so this port carries `verificationCode` as an unvalidated field (TypeScript and Python assert those vectors).
 - **DIV §5b Agent Authority** (`div-agent-authority` payloads). TypeScript-only. This port's approval verifier correctly REFUSES the payload type — an authority authorizes no action — it just cannot verify one as governance evidence.
+- **DIV §5c Platform Hash-Only Intent** (`div-platform-intent` payloads and the `platformIntentPayloads` vector section). TypeScript-only. This port's approval verifier correctly REFUSES the payload type (pinned by the `platform-intent-refused-by-approval-verifier` receipt fixture) — §5c requires a separate `verifyPlatformReceipt` entry point — it just cannot verify one.
+- **The document-signing payload** (`canonicalDocumentPayload`). This port carries no document canonicalization and does not assert the `documentPayloads` vector section — as `verify-go`, `verify-rust` and `sdk-python` also deliberately do not: the section's own note marks it TS-only (document signing is a gateway-side ceremony, not part of the relying-party offline surface). Approval and ledger canonicalization are unaffected — it is document *signing* that is out of scope here.
 
 One further precision about the portable-number rule (DEWP §4.3.1). This port refuses a non-portable number rather than best-effort serializing it, like `verify-go` — with a single exception it is not able to see: Jackson normalizes an integer-form `-0` to `0` while parsing, so the sign is gone before the check runs and that one value is serialized as `0`. The float form `-0.0` is refused correctly. No conformant producer emits either (JavaScript's `JSON.stringify(-0)` is already `"0"`, and the reference producer refuses at ingestion), so this is reachable only from a hand-authored or foreign document. The spec permits both responses, so the behaviour is conformant either way; it is stated here because "refuses" would otherwise be very slightly overclaiming.
 
@@ -84,7 +90,7 @@ For the rest of the surface — signed multi-anchor quorum, evidence bundles, ga
 
 ## Also available in
 - TypeScript — [`@intyga/verify`](https://github.com/intyga-dev/verify)
-- Python — [`intyga-sdk`](https://github.com/intyga-dev/sdk-python)
+- Python — [`verify-python`](https://github.com/intyga-dev/verify-python)
 - Go — [`verify-go`](https://github.com/intyga-dev/verify-go)
 - Rust — [`intyga-verify`](https://github.com/intyga-dev/verify-rust)
 

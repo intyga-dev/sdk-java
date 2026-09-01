@@ -13,6 +13,8 @@ import java.time.Duration;
 import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongSupplier;
 
 /**
  * Talks to an Intyga gateway. Blocking, like the Go and Rust clients — wrap it in your own executor
@@ -28,6 +30,11 @@ public final class IntygaClient {
   // How many back-to-back polling failures before requireApproval declares the gateway unreachable.
   private static final int MAX_POLL_ERRORS = 5;
 
+  // An exchanged token is re-exchanged this long before the expiry the gateway reported, capped at
+  // a tenth of the lifetime so a short-lived token is not refreshed on every call. 60s absorbs the
+  // clock skew and request latency a poll loop actually sees; every port uses the same margin.
+  private static final long MAX_REFRESH_MARGIN_NANOS = Duration.ofSeconds(60).toNanos();
+
   // Tree-model + own-final-records only. Polymorphic default typing (Jackson's CVE surface) is
   // never enabled. Unknown fields are ignored so a gateway that grows a response field does not
   // break deployed clients.
@@ -39,9 +46,24 @@ public final class IntygaClient {
   private final String clientId;
   private final String clientSecret;
   private final HttpClient http;
+  private final LongSupplier nanoClock;
 
   // The benign race (two threads exchanging concurrently, last write wins) matches the Go client.
-  private volatile String cachedToken;
+  // Invalidation on a 401 is a compare-and-set against the exact entry that was refused, so one
+  // thread's stale 401 cannot discard a token another thread has just exchanged.
+  private final AtomicReference<Cached> cached = new AtomicReference<>();
+
+  /**
+   * One exchanged token and when to stop serving it. {@code refreshAtNanos} is on the injected
+   * nano clock, already net of the refresh margin; it is meaningless (and ignored) when the gateway
+   * reported no {@code expires_in}, in which case the entry is served until a 401 evicts it.
+   */
+  private record Cached(String token, boolean expiryKnown, long refreshAtNanos) {
+    boolean fresh(long nowNanos) {
+      // Subtraction, not comparison: System.nanoTime() may be negative and wraps.
+      return !expiryKnown || nowNanos - refreshAtNanos < 0;
+    }
+  }
 
   private IntygaClient(Builder b) {
     if (b.gatewayUrl == null || b.gatewayUrl.isBlank()) {
@@ -59,6 +81,7 @@ public final class IntygaClient {
         b.httpClient != null
             ? b.httpClient
             : HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build();
+    this.nanoClock = b.nanoClock != null ? b.nanoClock : System::nanoTime;
   }
 
   public static Builder builder() {
@@ -66,19 +89,26 @@ public final class IntygaClient {
   }
 
   /**
-   * Resolves a bearer token: the provided one, a cached exchange, or a fresh client-credentials
-   * exchange (HTTP Basic at {@code POST /oauth/token}). The exchanged token is cached for the
-   * client's lifetime — the gateway's {@code expires_in} is documented as unreliable, so no
-   * proactive refresh is attempted; a 401 on a later call surfaces as {@link
-   * GatewayRefusedException}.
+   * Resolves a bearer token: the provided one, a cached exchange that is still fresh, or a fresh
+   * client-credentials exchange (HTTP Basic at {@code POST /oauth/token}).
+   *
+   * <p>An exchanged token is cached together with the {@code expires_in} the gateway reports — the
+   * TTL it actually signed — and served until {@code min(60s, expires_in / 10)} before that expiry,
+   * then exchanged again. So a long-lived client, or a {@link #requireApproval} wait that outlasts
+   * the token, keeps working across rotation with no help from the caller. A response with no
+   * {@code expires_in} is cached for the life of the client. Independently of the clock, a 401 on
+   * an exchanged token evicts it and the request is retried exactly once with a fresh exchange
+   * (clock skew, or a gateway that shortened its TTL); a second 401 surfaces as {@link
+   * GatewayRefusedException}. A 401 on an explicit {@link Builder#token} is never retried — there
+   * is nothing to re-exchange.
    */
   public String token() {
     if (token != null && !token.isEmpty()) {
       return token;
     }
-    String cached = cachedToken;
-    if (cached != null) {
-      return cached;
+    Cached c = cached.get();
+    if (c != null && c.fresh(nanoClock.getAsLong())) {
+      return c.token();
     }
     if (clientId == null || clientId.isEmpty() || clientSecret == null || clientSecret.isEmpty()) {
       throw new IntygaException("provide token, or clientId + clientSecret");
@@ -97,9 +127,27 @@ public final class IntygaClient {
       throw new GatewayRefusedException(
           res.statusCode(), "token exchange failed: " + res.statusCode() + " " + res.body());
     }
-    String exchanged = readJson(res.body(), TokenResponse.class, "token").accessToken();
-    cachedToken = exchanged;
+    TokenResponse parsed = readJson(res.body(), TokenResponse.class, "token");
+    String exchanged = parsed.accessToken();
+    cached.set(cacheEntry(exchanged, parsed.expiresIn(), nanoClock.getAsLong()));
     return exchanged;
+  }
+
+  // A missing, non-finite or non-positive expires_in is "no expiry known": the token is served
+  // until a 401 evicts it — the pre-refresh behaviour — rather than re-exchanged on every call. So
+  // is a lifetime too long to add to the nano clock without wrapping (decades); it is unbounded in
+  // practice and the 401 path still covers it.
+  private static Cached cacheEntry(String token, Double expiresIn, long nowNanos) {
+    if (expiresIn == null || !Double.isFinite(expiresIn) || expiresIn <= 0) {
+      return new Cached(token, false, 0L);
+    }
+    double lifetime = expiresIn * 1_000_000_000.0;
+    if (lifetime >= Long.MAX_VALUE / 4.0) {
+      return new Cached(token, false, 0L);
+    }
+    long lifetimeNanos = (long) lifetime;
+    long marginNanos = Math.min(MAX_REFRESH_MARGIN_NANOS, lifetimeNanos / 10);
+    return new Cached(token, true, nowNanos + lifetimeNanos - marginNanos);
   }
 
   /** Creates an approval challenge and returns its nonce and initial status. */
@@ -249,6 +297,11 @@ public final class IntygaClient {
   }
 
   private <T> T doJson(String method, String path, Object body, Class<T> type, String op) {
+    return doJson(method, path, body, type, op, false);
+  }
+
+  private <T> T doJson(
+      String method, String path, Object body, Class<T> type, String op, boolean retried) {
     String bearer = token();
     HttpRequest.Builder builder =
         HttpRequest.newBuilder(URI.create(gatewayUrl + path))
@@ -262,12 +315,32 @@ public final class IntygaClient {
       builder.method(method, HttpRequest.BodyPublishers.noBody());
     }
     HttpResponse<String> res = send(builder.build());
+    // A 401 on a token WE exchanged means it aged out (clock skew, a shortened gateway TTL) —
+    // evict it and re-exchange, exactly once. An explicit token is never retried: there is nothing
+    // to re-exchange, and looping on a revoked credential would only hide the refusal.
+    if (res.statusCode() == 401 && !retried && usesExchangedToken()) {
+      evictIfCurrent(bearer);
+      return doJson(method, path, body, type, op, true);
+    }
     if (res.statusCode() < 200 || res.statusCode() >= 300) {
       throw new GatewayRefusedException(
           res.statusCode(),
           method + " " + path + " failed: " + res.statusCode() + " " + res.body());
     }
     return readJson(res.body(), type, op);
+  }
+
+  private boolean usesExchangedToken() {
+    return token == null || token.isEmpty();
+  }
+
+  // Drop the cache only if it still holds the token that was refused: if another thread has
+  // already exchanged a fresh one, this stale 401 must not throw that away.
+  private void evictIfCurrent(String refused) {
+    Cached c = cached.get();
+    if (c != null && c.token().equals(refused)) {
+      cached.compareAndSet(c, null);
+    }
   }
 
   private HttpResponse<String> send(HttpRequest req) {
@@ -298,8 +371,11 @@ public final class IntygaClient {
     }
   }
 
+  // expires_in is nullable on purpose: a gateway (or proxy) that omits it must not NPE the
+  // exchange — it just yields a token with no known expiry.
   private record TokenResponse(
-      @com.fasterxml.jackson.annotation.JsonProperty("access_token") String accessToken) {}
+      @com.fasterxml.jackson.annotation.JsonProperty("access_token") String accessToken,
+      @com.fasterxml.jackson.annotation.JsonProperty("expires_in") Double expiresIn) {}
 
   /** Configures and constructs an {@link IntygaClient}. */
   public static final class Builder {
@@ -308,6 +384,7 @@ public final class IntygaClient {
     private String clientId;
     private String clientSecret;
     private HttpClient httpClient;
+    private LongSupplier nanoClock;
 
     private Builder() {}
 
@@ -340,6 +417,17 @@ public final class IntygaClient {
      */
     public Builder httpClient(HttpClient httpClient) {
       this.httpClient = httpClient;
+      return this;
+    }
+
+    /**
+     * Test seam, package-private on purpose: the monotonic clock the token cache ages against
+     * (defaults to {@link System#nanoTime()}). It drives ONLY the cache — the {@link
+     * IntygaClient#requireApproval} deadline stays on the real clock, so a frozen test clock can
+     * never turn a poll loop unbounded.
+     */
+    Builder nanoClock(LongSupplier nanoClock) {
+      this.nanoClock = nanoClock;
       return this;
     }
 

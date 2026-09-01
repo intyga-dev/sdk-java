@@ -152,7 +152,11 @@ public final class VerifyOptions {
       return this;
     }
 
-    /** Overrides "now" for expiry evaluation. Null means the current instant. */
+    /**
+     * Overrides "now" for time evaluation. Null means the current instant. Also the reference point
+     * for the forward-dating rule (DIV §5a.3 rule 3), which allowExpired does NOT waive: that
+     * option re-examines a proof that was valid and has lapsed, never one dated in the future.
+     */
     public Builder asOf(Instant asOf) {
       this.asOf = asOf;
       return this;

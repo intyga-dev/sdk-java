@@ -12,6 +12,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -100,6 +101,17 @@ class CanonicalVectorsTest {
     return String.join(",", copy);
   }
 
+  /**
+   * A case's committed evaluation time (DIV §5a.3 rule 3). Fails rather than defaulting to the wall
+   * clock: a missing asOf would silently restore the position-blind behaviour these vectors pin
+   * against, because the fixtures are dated far in the future so they never expire.
+   */
+  private static Instant asOf(JsonNode c) {
+    String raw = c.path("asOf").asText("");
+    assertFalse(raw.isEmpty(), c.get("name").asText() + ": vector carries no usable asOf");
+    return Instant.parse(raw);
+  }
+
   @Test
   void sharedStableStringifyVectors() {
     JsonNode doc = load();
@@ -113,16 +125,26 @@ class CanonicalVectorsTest {
     }
   }
 
+  /**
+   * Golden receipt vectors this suite deliberately does not drive, by name — empty today. The suite
+   * asserts the skipped set matches this EXACTLY, because the filter below drops a vector whose
+   * payload will not parse to the current version, which is precisely the shape a future fail-closed
+   * refusal vector would have: it would run nowhere and the build would still be green.
+   */
+  private static final List<String> EXPECTED_SKIPS = List.of();
+
   @Test
   void sharedGoldenReceiptVectors() {
     JsonNode doc = load();
     int checked = 0;
+    List<String> skipped = new ArrayList<>();
     for (JsonNode entry : doc.get("receipts")) {
       ApprovalReceipt receipt = Records.JSON.convertValue(entry.get("receipt"), ApprovalReceipt.class);
       String sigAlg = receipt.sigAlg() == null ? "" : receipt.sigAlg();
       if ("WEBAUTHN".equals(sigAlg)
           || (!"AUTO_APPROVED".equals(sigAlg)
               && canonicalVersion(receipt.canonicalPayload()) != Div.VERSION)) {
+        skipped.add(entry.get("name").asText());
         continue;
       }
       String signerKey = receipt.signerPublicKey() == null ? "" : receipt.signerPublicKey();
@@ -132,9 +154,22 @@ class CanonicalVectorsTest {
           entry.get("expectOk").asBoolean(),
           result.ok(),
           "vector " + entry.get("name").asText() + " (reason=" + result.reason() + ")");
+      // Pinning the REASON, not just the refusal: `0 >= 0` makes DIV §5 step 7 true with nothing
+      // counted, so this receipt can be refused for the right rule or for none at all.
+      if ("zero-required-approvals-refused".equals(entry.get("name").asText())) {
+        assertTrue(
+            result.reason() != null
+                && result.reason().contains("requiredApprovals must be an integer of at least 1"),
+            "zero-quorum vector refused for the wrong rule (reason=" + result.reason() + ")");
+      }
       checked++;
     }
-    assertTrue(checked >= 3, "expected to exercise the current-version vectors, ran " + checked);
+    assertEquals(
+        EXPECTED_SKIPS, skipped, "a golden receipt vector was skipped without being declared");
+    assertEquals(
+        doc.get("receipts").size() - EXPECTED_SKIPS.size(),
+        checked,
+        "expected to exercise every declared receipt vector, ran " + checked);
   }
 
   @Test
@@ -265,15 +300,25 @@ class CanonicalVectorsTest {
       ApprovalReceipt receipt = Records.JSON.convertValue(c.get("receipt"), ApprovalReceipt.class);
       Expected expected = expectationFor(receipt, anchor);
       String name = c.get("name").asText();
+      Instant evaluatedAt = asOf(c);
       VerifyResult withOptIn = Verify.verifyApprovalReceipt(
-          receipt, expected, VerifyOptions.builder().allowOffline(true).build());
+          receipt, expected, VerifyOptions.builder().allowOffline(true).asOf(evaluatedAt).build());
       assertEquals(c.get("expectOkWithOptIn").asBoolean(), withOptIn.ok(),
           name + " (reason=" + withOptIn.reason() + ")");
       // Optional in the vector file — absent means "not asserted", matching the Go suite.
       if (c.path("refusedWithoutOptIn").asBoolean(false)) {
         assertFalse(
-            Verify.verifyApprovalReceipt(receipt, expected, VerifyOptions.defaults()).ok(),
+            Verify.verifyApprovalReceipt(receipt, expected, VerifyOptions.builder().asOf(evaluatedAt).build()).ok(),
             name + " must be refused without the offline opt-in");
+      }
+      // The forward-dating rule sits outside AllowExpired's reach: that override re-examines a
+      // proof that WAS valid and has lapsed, never one dated in the future.
+      if ("offline-forward-dated-refused".equals(name)) {
+        VerifyResult audit = Verify.verifyApprovalReceipt(receipt, expected,
+            VerifyOptions.builder().allowOffline(true).allowExpired(true).asOf(evaluatedAt).build());
+        assertFalse(audit.ok(), name + " must not be rescued by the audit override");
+        assertTrue(audit.reason() != null && audit.reason().contains("challenged in the future"),
+            name + " (reason=" + audit.reason() + ")");
       }
     }
   }
@@ -287,8 +332,8 @@ class CanonicalVectorsTest {
     ApproverTrustAnchor anchor = didAnchor(suite.get("approvers"));
     for (JsonNode c : suite.get("cases")) {
       ApprovalReceipt receipt = Records.JSON.convertValue(c.get("receipt"), ApprovalReceipt.class);
-      DelegationVerification out =
-          Verify.verifyDelegation(receipt, expectationFor(receipt, anchor), VerifyOptions.defaults());
+      DelegationVerification out = Verify.verifyDelegation(
+          receipt, expectationFor(receipt, anchor), VerifyOptions.builder().asOf(asOf(c)).build());
       String name = c.get("name").asText();
       assertEquals(c.get("expectOk").asBoolean(), out.result().ok(),
           name + " (reason=" + out.result().reason() + ")");

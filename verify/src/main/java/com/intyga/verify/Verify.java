@@ -75,7 +75,14 @@ public final class Verify {
     if (opts.delegation() != null && !offline) {
       return VerifyResult.refuse("a delegation can only substitute the approver set for an offline approval");
     }
-    if (!Objects.equals(nz(fields.nonce()), nz(expected.nonce()))) {
+    // Naming the redeemed nonce is the caller's responsibility (DIV §5 steps 10-11), so an omitted
+    // one refuses instead of being coerced to "" — coercion would let a payload carrying an empty
+    // nonce satisfy a caller that never issued a challenge at all.
+    if (isEmpty(expected.nonce())) {
+      return VerifyResult.refuse(
+          "expected.Nonce is required — it must be the challenge YOU issued (DIV §5 step 10)");
+    }
+    if (!Objects.equals(nz(fields.nonce()), expected.nonce())) {
       return VerifyResult.refuse("receipt is for a different challenge");
     }
 
@@ -89,11 +96,28 @@ public final class Verify {
     if (isEmpty(fields.expiresAt())) {
       return VerifyResult.refuse("receipt missing expiresAt");
     }
+    // Both fail closed, as verifyDelegation already does for the target: an absent target would be
+    // canonicalized as "" and let a receipt minted for another service verify here, and an absent
+    // anchor would dereference to nothing instead of reaching the refusal it exists for.
+    if (isEmpty(expected.target())) {
+      return VerifyResult.refuse(
+          "expected.Target is required — it must be YOUR target identifier, asserted independently"
+              + " of the receipt (DIV Target Isolation)");
+    }
+    if (expected.approvers() == null) {
+      return VerifyResult.refuse(
+          "expected.Approvers is required — the Approver key MUST come from your own trust policy,"
+              + " never from the receipt (DIV Invariant 3)");
+    }
 
     // The requirement is part of the SIGNED bytes, so reading it back from the payload is not
     // circular: a forged value changes the string and fails the byte comparison below.
     if (fields.requirement() == null) {
       return VerifyResult.refuse("receipt payload is missing the signed approval requirement");
+    }
+    String quorumProblem = checkQuorumMinimum(fields.requirement());
+    if (quorumProblem != null) {
+      return VerifyResult.refuse(quorumProblem);
     }
     String classProblem = checkSignerClass(fields.requirement());
     if (classProblem != null) {
@@ -129,6 +153,14 @@ public final class Verify {
         return VerifyResult.refuse(String.format(
             "offline window is %.1f minutes, over the %d-minute maximum",
             window.toMillis() / 60000.0, Div.MAX_OFFLINE_WINDOW_MINUTES));
+      }
+      // The cap above bounds the window's WIDTH; this bounds its POSITION (DIV §5a.3 rule 3).
+      // Without it a proof challenged for a date years out, with a compliant 60-minute window,
+      // verifies today and keeps verifying until that date — the pre-signed bearer capability
+      // §5a.1 rejects. NOT gated on AllowExpired: that override re-examines a proof that WAS valid
+      // and has lapsed, and says nothing about one dated in the future.
+      if (challenged.toInstant().isAfter(latestAcceptableOrigin(opts))) {
+        return VerifyResult.refuse("offline proof is challenged in the future (DIV §5a.3)");
       }
       // A hardware-key policy CANNOT be satisfied offline (DIV §5a.3 step 4): WebAuthn needs a
       // secure context and an RP ID an offline signing surface will not match, so an offline
@@ -304,9 +336,6 @@ public final class Verify {
     if (delegatedQuorum > 0) {
       required = delegatedQuorum;
     }
-    if (required < 1) {
-      required = 1;
-    }
     if (verified.size() < required) {
       return VerifyResult.refuse(String.format(
           "quorum not met: %d of %d required approver signatures verified%s",
@@ -344,6 +373,19 @@ public final class Verify {
     }
     if (!Div.DELEGATION_TYPE.equals(fields.type())) {
       return refuseDelegation("payload is not a div-delegation");
+    }
+    if (expected.approvers() == null) {
+      return refuseDelegation(
+          "expected.Approvers is required — the Approver key MUST come from your own trust policy,"
+              + " never from the receipt (DIV Invariant 3)");
+    }
+    // DIV §4.4.6: a Delegation REQUIRES an identity-associating anchor and MUST be refused under a
+    // key-set anchor — at seal verification too, not only when delegatedTo is enforced at use time.
+    // The sealing quorum names PEOPLE; in public-keys mode it would count credentials instead.
+    if (expected.approvers().isKeySetMode()) {
+      return refuseDelegation(
+          "a delegation requires a DID-mode trust anchor (ApproverTrustAnchor.ofDids/ofDidsMultiKey);"
+              + " a key-set anchor cannot associate identities (DIV §4.4.6)");
     }
     if (fields.delegatedTo() == null || fields.delegatedTo().isEmpty()) {
       return refuseDelegation("delegation is missing a valid delegatedTo set");
@@ -391,11 +433,21 @@ public final class Verify {
           "delegation window is %.1f hours, over the %d-hour maximum",
           window.toMillis() / 3600000.0, Div.MAX_DELEGATION_WINDOW_HOURS));
     }
+    // Position, not just width (DIV §5a.6 step 1, mirroring §5a.3 rule 3). A forward-dated sealedAt
+    // slides the 72-hour window arbitrarily far out, and §5a.8 names that cap as Delegation's ONLY
+    // mitigation. Unconditional, like the offline mirror: AllowExpired does not reach it.
+    if (sealed.toInstant().isAfter(latestAcceptableOrigin(opts))) {
+      return refuseDelegation("delegation is sealed in the future (DIV §5a.6)");
+    }
     if (receipt.requester() == null) {
       return refuseDelegation("delegation missing requester");
     }
     if (fields.requirement() == null) {
       return refuseDelegation("delegation payload is missing the signed approval requirement");
+    }
+    String quorumProblem = checkQuorumMinimum(fields.requirement());
+    if (quorumProblem != null) {
+      return refuseDelegation(quorumProblem);
     }
     String classProblem = checkSignerClass(fields.requirement());
     if (classProblem != null) {
@@ -485,7 +537,7 @@ public final class Verify {
       }
       verified.add(matched);
     }
-    int required = Math.max(fields.requirement().requiredApprovals(), 1);
+    int required = fields.requirement().requiredApprovals();
     if (verified.size() < required) {
       return refuseDelegation(String.format(
           "delegation quorum not met: %d of %d required approver signatures verified%s",
@@ -528,6 +580,30 @@ public final class Verify {
     return null;
   }
 
+  /** Shared refusal text for a signed quorum below DIV §4.3.2's minimum. */
+  private static final String INVALID_QUORUM_REASON =
+      "signed requirement.requiredApprovals must be an integer of at least 1 (DIV §4.3.2)";
+
+  /**
+   * Enforces DIV §4.3.2: requiredApprovals is an integer ≥ 1. Stated as its own refusal rather than
+   * clamped, because §5 step 7 rejects unless the counted identities are AT LEAST this number — 0 is
+   * satisfied by counting nothing, so an unenforced minimum would attest an envelope carrying no
+   * valid witness signature. Returns null when acceptable, else the refusal reason.
+   */
+  private static String checkQuorumMinimum(ApprovalRequirement requirement) {
+    return requirement.requiredApprovals() < 1 ? INVALID_QUORUM_REASON : null;
+  }
+
+  /**
+   * The instant every time-based check shares — expiry (DIV §6.2) and the forward-dating rule of
+   * §5a.3 rule 3 — already widened by the caller's skew tolerance.
+   */
+  private static Instant latestAcceptableOrigin(VerifyOptions opts) {
+    Instant now = opts.asOf() != null ? opts.asOf() : Instant.now();
+    int skew = opts.clockSkewSeconds() != null ? opts.clockSkewSeconds() : Div.DEFAULT_CLOCK_SKEW_SECONDS;
+    return now.plusSeconds(skew);
+  }
+
   /** Renders at most {@link Div#MAX_REPORTED_FAILURES} per-witness reasons, eliding the rest as "+N more". */
   private static String foldFailures(List<String> failures) {
     if (failures.isEmpty()) {
@@ -549,7 +625,16 @@ public final class Verify {
   /** Normalizes a receipt to a witness list: {@code signatures} if present, else the single-signature fields. */
   private static List<ApprovalWitness> witnessesOf(ApprovalReceipt receipt) {
     if (receipt.signatures() != null && !receipt.signatures().isEmpty()) {
-      return receipt.signatures();
+      // Same guard the single-signature branch below applies, and for the same reason: the list is
+      // attacker-supplied JSON, so "signatures":[null] or a witness with no signature must drop out
+      // here rather than reach a base64 decoder as an NPE this method's callers do not catch.
+      List<ApprovalWitness> usable = new ArrayList<>(receipt.signatures().size());
+      for (ApprovalWitness w : receipt.signatures()) {
+        if (w != null && w.signature() != null) {
+          usable.add(w);
+        }
+      }
+      return usable;
     }
     if (receipt.signerPublicKey() == null || receipt.signature() == null) {
       return List.of();

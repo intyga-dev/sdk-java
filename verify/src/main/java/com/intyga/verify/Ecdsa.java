@@ -14,6 +14,7 @@ import java.security.spec.ECParameterSpec;
 import java.security.spec.ECPoint;
 import java.security.spec.ECPublicKeySpec;
 import java.security.spec.X509EncodedKeySpec;
+import java.util.Arrays;
 
 /** ES256 (P-256 + SHA-256) primitives on the JDK's own providers — no crypto dependency. */
 final class Ecdsa {
@@ -94,6 +95,15 @@ final class Ecdsa {
    * IEEE-P1363 (r‖s) encodings — matching every other port.
    */
   static boolean verifySignature(ECPublicKey pub, byte[] message, byte[] sig) {
+    // Range-check r and s HERE rather than trusting the platform provider to do it. On JDK 15-18
+    // before 17.0.3 (CVE-2022-21449) an all-zero ECDSA signature verifies under ANY key, and this
+    // library is the thing that refuses unapproved actions — a relying party's patch level is not
+    // ours to control, and this port targets release 17. Go's ecdsa.VerifyASN1 and Rust's p256 crate
+    // reject zero scalars in-library; this is the same guarantee, stated. Pre-filter only: it can
+    // remove acceptances, never add one.
+    if (!scalarsInRange(sig)) {
+      return false;
+    }
     try {
       Signature verifier = Signature.getInstance("SHA256withECDSA");
       verifier.initVerify(pub);
@@ -117,6 +127,59 @@ final class Ecdsa {
       }
     }
     return false;
+  }
+
+  /**
+   * Whether both scalars of {@code sig} lie in [1, n-1], under either encoding this verifier
+   * accepts. A signature whose bytes are neither a well-formed DER SEQUENCE of two INTEGERs nor a
+   * 64-byte r‖s pair is rejected — the platform verifier would reject it too, so nothing valid is
+   * lost.
+   */
+  private static boolean scalarsInRange(byte[] sig) {
+    BigInteger[] der = derScalars(sig);
+    if (der != null && inRange(der[0]) && inRange(der[1])) {
+      return true;
+    }
+    if (sig.length == 64) {
+      return inRange(new BigInteger(1, Arrays.copyOfRange(sig, 0, 32)))
+          && inRange(new BigInteger(1, Arrays.copyOfRange(sig, 32, 64)));
+    }
+    return false;
+  }
+
+  private static boolean inRange(BigInteger v) {
+    return v.signum() > 0 && v.compareTo(P256.getOrder()) < 0;
+  }
+
+  /**
+   * Reads (r, s) out of an ASN.1 DER {@code SEQUENCE { INTEGER, INTEGER }}, short-form lengths only
+   * — a P-256 signature is at most 72 bytes, so it never needs the long form. Returns null when the
+   * bytes are not exactly that shape.
+   */
+  private static BigInteger[] derScalars(byte[] der) {
+    if (der.length < 8 || der.length > 72 || (der[0] & 0xff) != 0x30) {
+      return null;
+    }
+    int seqLen = der[1] & 0xff;
+    if (seqLen > 0x7f || seqLen != der.length - 2) {
+      return null;
+    }
+    BigInteger[] out = new BigInteger[2];
+    int i = 2;
+    for (int k = 0; k < 2; k++) {
+      if (i + 2 > der.length || (der[i] & 0xff) != 0x02) {
+        return null;
+      }
+      int len = der[i + 1] & 0xff;
+      if (len == 0 || len > 0x7f || i + 2 + len > der.length) {
+        return null;
+      }
+      // DER INTEGERs are signed two's complement, which is exactly how this constructor reads them,
+      // so a negative encoding falls out of range below instead of being silently made positive.
+      out[k] = new BigInteger(Arrays.copyOfRange(der, i + 2, i + 2 + len));
+      i += 2 + len;
+    }
+    return i == der.length ? out : null;
   }
 
   private Ecdsa() {}

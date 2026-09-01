@@ -2,9 +2,12 @@
 
 Gate any high-risk backend action behind a real human approval. The primitive is uniform: **request a challenge → a human approves with a passkey or security key → poll until resolved** — the same client works for scripts, pipelines, and AI agents.
 
-This package **bundles the offline verifier** ([`com.intyga:intyga-verify`](../verify-java)), so you can request an approval *and* independently verify the receipt without adding a second dependency.
+This package **bundles the offline verifier** ([`com.intyga:intyga-verify`](https://github.com/intyga-dev/verify-java)), so you can request an approval *and* independently verify the receipt without adding a second dependency.
 
-> Status: **not yet published** to Maven Central. Until then, build both locally — `mvn install` in [`packages/verify-java`](../verify-java) first, then in this directory.
+> Status: **not yet published** to Maven Central. Until then, build from source: `mvn install` at
+> this repository's root, whose aggregator reactor builds the bundled verifier before the client that
+> depends on it. (Working in the Intyga monorepo instead? There is no aggregator there — `mvn install`
+> in `packages/verify-java`, then in `packages/sdk-java`.)
 
 Runtime dependencies: `com.intyga:intyga-verify` and Jackson (`jackson-databind`) for JSON — Java has no stdlib JSON. HTTP is the JDK's built-in `java.net.http`, and all cryptography is the JDK's own. Nothing else.
 
@@ -83,13 +86,13 @@ For framework code (a Spring/Quarkus handler, a LangChain4j tool method), `requi
 
 ## API
 
-- `IntygaClient.builder()` — `gatewayUrl` + either a pre-minted `token` or `clientId`/`clientSecret`; `build()` performs no I/O.
+- `IntygaClient.builder()` — `gatewayUrl` + either a pre-minted `token` or `clientId`/`clientSecret`; `build()` performs no I/O. An exchanged token is re-exchanged automatically shortly before the `expires_in` the gateway reports (and once more on a 401), so a long-lived client never has to manage tokens; a pre-minted `token` is used as given and never refreshed.
 - `requireApproval(description, options)` — create a challenge and block until resolved (default 120s wait, 2s poll).
 - `requireApprovalOrThrow(description, options)` — same, but non-APPROVED throws `ApprovalRefusedException`.
 - `authorize` / `status` / `consume` — the individual steps (create, poll, execution-time re-bind). `authorize` requires a `target`; `consume` takes `(nonce, target, actionType, params)` and must be given the same target the approval was bound to.
 - `verify(documentHash)` — public witness lookup.
 - Exceptions: `GatewayRefusedException` (the gateway answered non-2xx; carries the status) vs `GatewayUnreachableException` (could not ask at all) — kept distinct because a policy refusal handled as an outage is a policy bypass.
-- Offline verification: `com.intyga.verify.Verify.verifyApprovalReceipt(...)` — see [`verify-java`](../verify-java).
+- Offline verification: `com.intyga.verify.Verify.verifyApprovalReceipt(...)` — see [`verify-java`](https://github.com/intyga-dev/verify-java).
 
 ## Examples
 

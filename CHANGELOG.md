@@ -5,6 +5,17 @@ All notable changes to `com.intyga:intyga-sdk` are documented here. The format f
 
 ## [Unreleased]
 
+- **Tokens are refreshed automatically.** `IntygaClient` now reads `expires_in` from the
+  client-credentials exchange and re-exchanges `min(60s, expires_in / 10)` before expiry, so a
+  long-lived client (or a `requireApproval` wait longer than the token's life) no longer fails
+  every call once the token has expired. A 401 on an exchanged token is retried exactly once with a
+  fresh exchange. A response without `expires_in` is cached for the life of the client, as before.
+- An explicit `Builder.token(...)` is never re-exchanged: a 401 on it surfaces as
+  `GatewayRefusedException` unchanged — there is no client secret behind it.
+- Correction to the 1.0.0 entry below: "lifetime caching" described a defect, not a feature. 1.0.0
+  never re-exchanged and never evicted on 401, so a client older than the gateway's token TTL was
+  refused on every call until restarted.
+
 ## [1.0.0]
 
 Initial public release.

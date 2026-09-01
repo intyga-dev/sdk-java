@@ -47,6 +47,11 @@ public final class ApproverTrustAnchor {
     return new ApproverTrustAnchor(null, List.copyOf(dids), null, resolveKeys);
   }
 
+  /** True in direct-allowlist mode, where the identity IS the key and no DID can be verified. */
+  boolean isKeySetMode() {
+    return publicKeys != null;
+  }
+
   /** One (key, identity) candidate pair for a witness. */
   record Candidate(String key, String identity) {}
 

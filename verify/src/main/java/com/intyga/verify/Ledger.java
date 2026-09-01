@@ -123,6 +123,12 @@ public final class Ledger {
    */
   public static boolean verifyMerkleProof(
       String leaf, List<LedgerProofStep> proof, String root, ProofBounds bounds) {
+    // A total boolean predicate, like the TS reference: this package is the trust anchor a relying
+    // party calls, and a missing bounds/proof must refuse rather than throw out of a method whose
+    // whole contract is "true or false".
+    if (bounds == null || proof == null) {
+      return false;
+    }
     if (!isHash64(leaf) || !isHash64(root)) {
       return false;
     }
@@ -136,7 +142,7 @@ public final class Ledger {
     int levelSize = bounds.leafCount();
     String node = leaf;
     for (LedgerProofStep step : proof) {
-      if (!isHash64(step.siblingHash())) {
+      if (step == null || !isHash64(step.siblingHash())) {
         return false;
       }
       // The side follows from the index; a prover-chosen side would restore the flexibility the

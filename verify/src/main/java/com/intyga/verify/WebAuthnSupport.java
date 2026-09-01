@@ -194,7 +194,7 @@ final class WebAuthnSupport {
 
     byte[] clientDataBuf;
     try {
-      clientDataBuf = Base64.getDecoder().decode(w.clientDataJSON());
+      clientDataBuf = decodeBase64Flexible(w.clientDataJSON());
     } catch (IllegalArgumentException e) {
       return "invalid clientDataJSON base64";
     }
@@ -226,7 +226,7 @@ final class WebAuthnSupport {
 
     byte[] authData;
     try {
-      authData = Base64.getDecoder().decode(w.authenticatorData());
+      authData = decodeBase64Flexible(w.authenticatorData());
     } catch (IllegalArgumentException e) {
       return "invalid authenticatorData base64";
     }
@@ -252,7 +252,7 @@ final class WebAuthnSupport {
     // The COSE key is parsed from the TRUSTED key, not the receipt's copy.
     byte[] coseBuf;
     try {
-      coseBuf = Base64.getDecoder().decode(trustedKey);
+      coseBuf = decodeBase64Flexible(trustedKey);
     } catch (IllegalArgumentException e) {
       return "invalid trusted key base64";
     }
@@ -264,7 +264,7 @@ final class WebAuthnSupport {
     }
     byte[] sigBytes;
     try {
-      sigBytes = Base64.getDecoder().decode(w.signature());
+      sigBytes = decodeBase64Flexible(w.signature());
     } catch (IllegalArgumentException e) {
       return "invalid signature base64";
     }
@@ -285,6 +285,21 @@ final class WebAuthnSupport {
     } catch (NoSuchAlgorithmException e) {
       throw new IllegalStateException(e);
     }
+  }
+
+  /**
+   * Accepts both base64url — the DIV §4.4.2 wire form, which browsers and the gateway emit
+   * unpadded — and standard base64 (legacy receipts, older vectors), padded or not. The alphabets
+   * differ only in characters 62/63 ({@code +/} vs {@code -_}), so normalizing is lossless and
+   * cannot make an invalid encoding valid.
+   */
+  private static byte[] decodeBase64Flexible(String s) {
+    String normalized = s.replace('-', '+').replace('_', '/');
+    int rem = normalized.length() % 4;
+    if (rem != 0) {
+      normalized = normalized + "====".substring(rem);
+    }
+    return Base64.getDecoder().decode(normalized);
   }
 
   /** Removes trailing '=' so a padded challenge compares equal to the unpadded form. */
