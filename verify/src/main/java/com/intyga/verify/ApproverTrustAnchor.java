@@ -3,6 +3,8 @@ package com.intyga.verify;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Function;
+import java.util.Base64;
+import java.security.MessageDigest;
 
 /**
  * The set of approver keys the relying party trusts, resolved from its OWN key-management policy.
@@ -66,6 +68,10 @@ public final class ApproverTrustAnchor {
    * step 3) — applied ON TOP of the trust anchor, never instead of it.
    */
   Candidates candidatesRestricted(String signerDid, List<String> restrictTo) {
+    return candidatesRestricted(signerDid, null, restrictTo);
+  }
+
+  Candidates candidatesRestricted(String signerDid, String presentedKey, List<String> restrictTo) {
     if (publicKeys != null && !publicKeys.isEmpty()) {
       // A delegation names identities, and in publicKeys mode signerDid is an unverified string —
       // enforcing delegatedTo against it would be security theatre. Refuse rather than pretend.
@@ -82,7 +88,7 @@ public final class ApproverTrustAnchor {
       }
       return new Candidates(out, null);
     }
-    if (dids == null || dids.isEmpty() || (resolveKey == null && resolveKeys == null)) {
+    if (dids == null || dids.isEmpty()) {
       return new Candidates(
           null,
           "expected.Approvers is required — the Approver key MUST come from your own trust policy,"
@@ -99,7 +105,7 @@ public final class ApproverTrustAnchor {
     if (resolveKeys != null) {
       keys = resolveKeys.apply(signerDid);
     } else {
-      String key = resolveKey.apply(signerDid);
+      String key = resolveKey == null ? null : resolveKey.apply(signerDid);
       keys = key == null || key.isEmpty() ? List.of() : List.of(key);
     }
     List<Candidate> out = new ArrayList<>();
@@ -109,6 +115,22 @@ public final class ApproverTrustAnchor {
           // All keys for one DID share that DID as their identity — quorum still counts one approver.
           out.add(new Candidate(k, signerDid));
         }
+      }
+    }
+    // Explicit directory mappings take precedence. Only when they yield no key may a pinned
+    // self-certifying DID authenticate the exact key bytes carried by the witness.
+    if (out.isEmpty() && signerDid.startsWith("did:intyga:key:") && presentedKey != null) {
+      try {
+        byte[] raw = Base64.getDecoder().decode(presentedKey);
+        String fingerprint = Base64.getUrlEncoder().withoutPadding()
+            .encodeToString(MessageDigest.getInstance("SHA-256").digest(raw));
+        if (signerDid.equals("did:intyga:key:" + fingerprint)) {
+          out.add(new Candidate(presentedKey, signerDid));
+        } else {
+          return new Candidates(null, "witness public key does not hash to the pinned self-certifying DID");
+        }
+      } catch (Exception e) {
+        return new Candidates(null, "witness carries no valid public key for its self-certifying DID");
       }
     }
     if (out.isEmpty()) {

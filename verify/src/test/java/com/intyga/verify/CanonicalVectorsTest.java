@@ -324,6 +324,36 @@ class CanonicalVectorsTest {
   }
 
   @Test
+  void cachedDelegationExpiryIsRecheckedWhenUsed() {
+    JsonNode doc = load();
+    ApprovalReceipt receipt = Records.JSON.convertValue(
+        doc.get("offlineReceipts").get(0).get("receipt"), ApprovalReceipt.class);
+    Expected base = expectationFor(receipt, ApproverTrustAnchor.ofPublicKeys(List.of()));
+    String did = receipt.signerDid();
+    Expected expected = new Expected(base.target(), base.nonce(), base.actionType(), base.params(),
+        ApproverTrustAnchor.ofDids(List.of(did), ignored -> receipt.signerPublicKey()));
+    VerifiedDelegation delegation = new VerifiedDelegation(List.of(did), 1, base.target(),
+        base.actionType(), base.params(), "cached", List.of(), "2998-12-31T23:59:00Z");
+    java.util.function.BiFunction<String, Boolean, VerifyResult> verifyAt = (at, allowExpired) ->
+        Verify.verifyApprovalReceipt(receipt, expected, VerifyOptions.builder().allowOffline(true)
+            .allowExpired(allowExpired).asOf(Instant.parse(at)).delegation(delegation).build());
+    assertTrue(verifyAt.apply("2998-12-31T23:58:59Z", false).ok());
+    assertTrue(verifyAt.apply("2998-12-31T23:59:30Z", false).ok());
+    VerifyResult expired = verifyAt.apply("2998-12-31T23:59:31Z", false);
+    assertFalse(expired.ok());
+    assertTrue(expired.reason().contains("delegation has expired"));
+    assertTrue(Verify.verifyApprovalReceipt(receipt, expected, VerifyOptions.builder().allowOffline(true)
+        .asOf(Instant.parse("2998-12-31T23:59:31Z")).build()).ok());
+    assertTrue(verifyAt.apply("2998-12-31T23:59:31Z", true).ok());
+    VerifiedDelegation malformed = new VerifiedDelegation(List.of(did), 1, base.target(),
+        base.actionType(), base.params(), "cached", List.of(), "invalid");
+    VerifyResult invalid = Verify.verifyApprovalReceipt(receipt, expected,
+        VerifyOptions.builder().allowOffline(true).allowExpired(true)
+            .asOf(Instant.parse("2998-12-31T23:58:59Z")).delegation(malformed).build());
+    assertFalse(invalid.ok());
+  }
+
+  @Test
   void sharedDelegationReceiptVectors() {
     JsonNode doc = load();
     JsonNode suite = doc.get("delegationReceipts");

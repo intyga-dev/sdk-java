@@ -5,6 +5,10 @@ All notable changes to `com.intyga:intyga-sdk` are documented here. The format f
 
 ## [Unreleased]
 
+- Rebuilt against the DIV Intent Payload's new REQUIRED `evidence` field (DIV §4.3.4), which is
+  `null` in this version. No API change; receipts carry the field inside `canonicalPayload` only.
+
+- `authorize` now omits `actionType` when unset, matching the gateway's optional field schema.
 - **Tokens are refreshed automatically.** `IntygaClient` now reads `expires_in` from the
   client-credentials exchange and re-exchanges `min(60s, expires_in / 10)` before expiry, so a
   long-lived client (or a `requireApproval` wait longer than the token's life) no longer fails

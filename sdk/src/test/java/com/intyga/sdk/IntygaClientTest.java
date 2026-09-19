@@ -426,6 +426,7 @@ class IntygaClientTest {
           expect(
               "prod-payments".equals(body.path("target").asText()),
               "authorize: target missing from body");
+          expect(!body.has("actionType"), "authorize: unset actionType must be omitted");
           respond(exchange, 200, "{\"nonce\":\"n_t\",\"status\":\"PENDING\"}");
         });
 
@@ -435,6 +436,21 @@ class IntygaClientTest {
 
     assertEquals("n_t", r.nonce());
     assertEquals(ApprovalStatus.PENDING, r.status());
+    assertNoViolations();
+  }
+
+  @Test
+  void authorizePreservesExplicitActionType() {
+    server.createContext(
+        "/authorize",
+        exchange -> {
+          JsonNode body = JSON.readTree(readBody(exchange));
+          expect("wipe_production".equals(body.path("actionType").asText()),
+              "authorize: explicit actionType was not preserved");
+          respond(exchange, 200, "{\"nonce\":\"n_t\",\"status\":\"PENDING\"}");
+        });
+    IntygaClient client = IntygaClient.builder().gatewayUrl(baseUrl()).token("t").build();
+    client.authorize("x", wipeOptions());
     assertNoViolations();
   }
 

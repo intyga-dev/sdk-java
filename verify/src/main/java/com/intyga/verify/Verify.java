@@ -13,6 +13,8 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+import java.util.Map;
+import java.util.LinkedHashMap;
 
 /**
  * Offline verification of DIV approval receipts: recompute the canonical payload from the caller's
@@ -20,6 +22,173 @@ import java.util.Set;
  * signature against a key the caller resolved — no Intyga secret, no network.
  */
 public final class Verify {
+
+  /** Byte-identical DIV §5c canonical platform intent. */
+  public static String canonicalPlatformIntentPayload(
+      String payloadHash, String rpId, String subjectExternalId,
+      String signedAt, String expiresAt, String nonce) {
+    Map<String, Object> m = new LinkedHashMap<>();
+    m.put("v", Div.VERSION); m.put("type", Div.PLATFORM_INTENT_TYPE); m.put("hashAlg", "SHA-256");
+    m.put("payloadHash", payloadHash); m.put("rpId", rpId);
+    m.put("subject", Map.of("externalId", subjectExternalId));
+    m.put("signedAt", signedAt); m.put("expiresAt", expiresAt); m.put("nonce", nonce);
+    return Canonical.stableStringify(m);
+  }
+
+  /** Byte-identical DIV §5b canonical authority statement. Set-valued fields are sorted. */
+  public static String canonicalAgentAuthorityPayload(
+      String target, List<String> actionPatterns, String display, String agentDid,
+      RequesterIdentity requester, ApprovalRequirement requirement,
+      String nonce, String sealedAt, String expiresAt) {
+    List<String> patterns = new ArrayList<>(actionPatterns); Collections.sort(patterns);
+    List<String> aaguids = new ArrayList<>(requirement.allowedAaguids()); Collections.sort(aaguids);
+    Map<String, Object> req = new LinkedHashMap<>();
+    req.put("requiredApprovals", requirement.requiredApprovals());
+    req.put("requireHardwareKey", requirement.requireHardwareKey());
+    req.put("allowedAaguids", aaguids); req.put("requesterCannotApprove", requirement.requesterCannotApprove());
+    req.put("signerClass", requirement.signerClass());
+    Map<String, Object> requesterMap = new LinkedHashMap<>(); requesterMap.put("did", requester.did());
+    RequesterAttestation a = requester.attestation();
+    requesterMap.put("attestation", a == null ? null : Map.of("method", a.method(), "issuer", a.issuer(), "subject", a.subject()));
+    Map<String, Object> m = new LinkedHashMap<>();
+    m.put("v", Div.VERSION); m.put("type", Div.AGENT_AUTHORITY_TYPE); m.put("target", target);
+    m.put("actionPatterns", patterns); m.put("display", display); m.put("agent", Map.of("did", agentDid));
+    m.put("requester", requesterMap); m.put("requirement", req); m.put("nonce", nonce);
+    m.put("sealedAt", sealedAt); m.put("expiresAt", expiresAt);
+    return Canonical.stableStringify(m);
+  }
+
+  /** Verify a DIV §5c hash-only receipt. Every accepted witness is WebAuthn-bound to the RP. */
+  public static PlatformVerification verifyPlatformReceipt(
+      PlatformReceipt receipt, PlatformExpected expected, VerifyOptions opts) {
+    try {
+      return verifyPlatformReceiptChecked(receipt, expected, opts == null ? VerifyOptions.defaults() : opts);
+    } catch (RuntimeException e) {
+      return PlatformVerification.refuse("malformed receipt or verification input");
+    }
+  }
+
+  private static PlatformVerification verifyPlatformReceiptChecked(
+      PlatformReceipt receipt, PlatformExpected expected, VerifyOptions opts) {
+    com.fasterxml.jackson.databind.JsonNode p;
+    try { p = Records.JSON.readTree(receipt.canonicalPayload()); }
+    catch (Exception e) { return PlatformVerification.refuse("canonicalPayload is not valid JSON"); }
+    if (p.path("v").asInt(-1) != Div.VERSION) return PlatformVerification.refuse("unsupported DIV payload version");
+    String type = p.path("type").asText("");
+    if (!Div.PLATFORM_INTENT_TYPE.equals(type)) {
+      return PlatformVerification.refuse(Div.INTENT_TYPE.equals(type) || Div.OFFLINE_INTENT_TYPE.equals(type)
+          ? "this is an ordinary approval receipt — verify it with verifyApprovalReceipt"
+          : "payload is not a div-platform-intent");
+    }
+    if (expected == null || expected.approvers() == null) return PlatformVerification.refuse("expected.approvers is required");
+    if (isEmpty(expected.nonce())) return PlatformVerification.refuse("expected.nonce is required");
+    if (!p.path("nonce").asText("").equals(expected.nonce())) return PlatformVerification.refuse("receipt is for a different challenge");
+    if (expected.payloadHash() == null || !expected.payloadHash().matches("[0-9a-f]{64}"))
+      return PlatformVerification.refuse("expected.payloadHash must be the 64-character lowercase hex SHA-256 you recomputed yourself");
+    if (isEmpty(expected.rpId())) return PlatformVerification.refuse("expected.rpId is required");
+    if (opts.expectedRpId() != null && !opts.expectedRpId().equals(expected.rpId()))
+      return PlatformVerification.refuse("opts.expectedRpId conflicts with expected.rpId — pass the RP ID once");
+    String signedAt = p.path("signedAt").asText(""); String expiresAt = p.path("expiresAt").asText("");
+    String subject = p.path("subject").path("externalId").asText("");
+    if (isEmpty(signedAt)) return PlatformVerification.refuse("receipt missing signedAt");
+    if (isEmpty(expiresAt)) return PlatformVerification.refuse("receipt missing expiresAt");
+    if (isEmpty(subject)) return PlatformVerification.refuse("receipt missing subject.externalId");
+    if (expected.subjectExternalId() != null && !expected.subjectExternalId().equals(subject))
+      return PlatformVerification.refuse("receipt was signed by a different subject");
+    String canonical = canonicalPlatformIntentPayload(expected.payloadHash(), expected.rpId(), subject, signedAt, expiresAt, expected.nonce());
+    if (!canonical.equals(receipt.canonicalPayload())) return PlatformVerification.refuse("payloadHash/rpId do not match what was signed");
+    Instant signed; Instant expiry;
+    try { signed = Instant.parse(signedAt); } catch (Exception e) { return PlatformVerification.refuse("signedAt is not a valid RFC3339 timestamp"); }
+    try { expiry = Instant.parse(expiresAt); } catch (Exception e) { return PlatformVerification.refuse("expiresAt is not a valid RFC3339 timestamp"); }
+    if (expiry.isBefore(signed)) return PlatformVerification.refuse("receipt expires before it was signed");
+    Instant now = opts.asOf() == null ? Instant.now() : opts.asOf();
+    long skew = opts.clockSkewSeconds() == null ? Div.DEFAULT_CLOCK_SKEW_SECONDS : opts.clockSkewSeconds();
+    if (signed.isAfter(now.plusSeconds(skew))) return PlatformVerification.refuse("receipt is signed in the future (DIV §5c.3)");
+    if (!opts.allowExpired() && now.isAfter(expiry.plusSeconds(skew))) return PlatformVerification.refuse("proof has expired");
+    if ("AUTO_APPROVED".equals(receipt.sigAlg())) return PlatformVerification.refuse("a platform receipt cannot be auto-approved");
+    ApprovalReceipt ar = new ApprovalReceipt(receipt.canonicalPayload(), null, null, "", Map.of(), receipt.signatures(),
+        receipt.signerDid(), receipt.signerPublicKey(), receipt.signature(), receipt.sigAlg(), receipt.authenticatorData(),
+        receipt.clientDataJSON(), null, receipt.verificationCode());
+    List<ApprovalWitness> ws = witnessesOf(ar);
+    if (ws.isEmpty()) return PlatformVerification.refuse("receipt missing signature material");
+    if (ws.size() > Div.MAX_WITNESSES) return PlatformVerification.refuse("receipt carries too many witnesses");
+    VerifyOptions effective = VerifyOptions.builder().expectedOrigin(opts.expectedOrigin()).expectedRpId(expected.rpId())
+        .requireUserVerification(opts.requireUserVerification() == null || opts.requireUserVerification())
+        .allowCrossOrigin(opts.allowCrossOrigin()).asOf(now).clockSkewSeconds((int) skew).build();
+    Set<String> verified = new LinkedHashSet<>(); List<String> failures = new ArrayList<>();
+    for (ApprovalWitness w : ws) {
+      if (!"WEBAUTHN".equals(w.sigAlg())) { failures.add("signer " + w.signerDid() + " used a bare key; platform receipts are WebAuthn-only"); continue; }
+      ApproverTrustAnchor.Candidates cs = expected.approvers().candidatesRestricted(w.signerDid(), w.signerPublicKey(), null);
+      if (cs.error() != null) { failures.add(cs.error()); continue; }
+      boolean ok = false; String last = "signature does not verify against any trusted subject key";
+      for (ApproverTrustAnchor.Candidate c : cs.list()) { last = verifyWitness(w, c.key(), ar, effective); if (last.isEmpty()) { verified.add(c.identity()); ok = true; break; } }
+      if (!ok) failures.add(last);
+    }
+    if (verified.isEmpty()) return PlatformVerification.refuse("no valid subject signature" + foldFailures(failures));
+    List<String> signers = new ArrayList<>(verified); Collections.sort(signers);
+    return new PlatformVerification(true, null, signers);
+  }
+
+  /** Verify a quorum-sealed DIV §5b authority. It never verifies as an approval. */
+  public static AgentAuthorityVerification verifyAgentAuthority(
+      ApprovalReceipt receipt, AgentAuthorityExpected expected, VerifyOptions opts) {
+    try {
+      return verifyAgentAuthorityChecked(receipt, expected, opts == null ? VerifyOptions.defaults() : opts);
+    } catch (RuntimeException e) {
+      return AgentAuthorityVerification.refuse("malformed receipt or verification input");
+    }
+  }
+
+  private static AgentAuthorityVerification verifyAgentAuthorityChecked(
+      ApprovalReceipt receipt, AgentAuthorityExpected expected, VerifyOptions opts) {
+    com.fasterxml.jackson.databind.JsonNode p;
+    try { p = Records.JSON.readTree(receipt.canonicalPayload()); }
+    catch (Exception e) { return AgentAuthorityVerification.refuse("canonicalPayload is not valid JSON"); }
+    if (p.path("v").asInt(-1) != Div.VERSION) return AgentAuthorityVerification.refuse("unsupported DIV payload version");
+    if (!Div.AGENT_AUTHORITY_TYPE.equals(p.path("type").asText())) return AgentAuthorityVerification.refuse("payload is not a div-agent-authority");
+    List<String> patterns = new ArrayList<>();
+    if (!p.path("actionPatterns").isArray()) return AgentAuthorityVerification.refuse("authority is missing a valid actionPatterns set");
+    for (com.fasterxml.jackson.databind.JsonNode n : p.path("actionPatterns")) { if (!n.isTextual() || n.asText().isEmpty()) return AgentAuthorityVerification.refuse("authority is missing a valid actionPatterns set"); patterns.add(n.asText()); }
+    if (patterns.isEmpty()) return AgentAuthorityVerification.refuse("authority is missing a valid actionPatterns set");
+    String sealedAt = p.path("sealedAt").asText(""); String expiresAt = p.path("expiresAt").asText(""); String nonce = p.path("nonce").asText("");
+    Instant sealed; Instant expiry;
+    try { sealed = Instant.parse(sealedAt); } catch (Exception e) { return AgentAuthorityVerification.refuse("sealedAt is not a valid RFC3339 timestamp"); }
+    try { expiry = Instant.parse(expiresAt); } catch (Exception e) { return AgentAuthorityVerification.refuse("expiresAt is not a valid RFC3339 timestamp"); }
+    if (expiry.isBefore(sealed)) return AgentAuthorityVerification.refuse("authority expires before it was sealed");
+    Instant now = opts.asOf() == null ? Instant.now() : opts.asOf(); long skew = opts.clockSkewSeconds() == null ? Div.DEFAULT_CLOCK_SKEW_SECONDS : opts.clockSkewSeconds();
+    if (sealed.isAfter(now.plusSeconds(skew))) return AgentAuthorityVerification.refuse("authority is sealed in the future (DIV §5b.2)");
+    if (!opts.allowExpired() && now.isAfter(expiry.plusSeconds(skew))) return AgentAuthorityVerification.refuse("authority has expired");
+    if (receipt.requester() == null) return AgentAuthorityVerification.refuse("authority missing requester");
+    ApprovalRequirement requirement;
+    try { requirement = Records.JSON.treeToValue(p.path("requirement"), ApprovalRequirement.class); }
+    catch (Exception e) { return AgentAuthorityVerification.refuse("authority payload is missing the signed approval requirement"); }
+    if (requirement == null || requirement.requiredApprovals() < 1) return AgentAuthorityVerification.refuse(INVALID_QUORUM_REASON);
+    String classProblem = checkSignerClass(requirement); if (classProblem != null) return AgentAuthorityVerification.refuse(classProblem);
+    if (expected == null || isEmpty(expected.target()) || isEmpty(expected.agentDid()) || expected.approvers() == null)
+      return AgentAuthorityVerification.refuse("expected target, agentDid and approvers are required");
+    String rebuilt = canonicalAgentAuthorityPayload(expected.target(), patterns, receipt.actionDescription(), expected.agentDid(), receipt.requester(), requirement, nonce, sealedAt, expiresAt);
+    if (!rebuilt.equals(receipt.canonicalPayload())) return AgentAuthorityVerification.refuse("target/agent/actionPatterns do not match what was sealed");
+    if ("AUTO_APPROVED".equals(receipt.sigAlg())) return AgentAuthorityVerification.refuse("an agent authority cannot be auto-approved");
+    List<ApprovalWitness> ws = witnessesOf(receipt); if (ws.isEmpty()) return AgentAuthorityVerification.refuse("authority missing signature material");
+    if (ws.size() > Div.MAX_WITNESSES) return AgentAuthorityVerification.refuse("authority carries too many witnesses");
+    if (requirement.requesterCannotApprove() && expected.approvers().isKeySetMode())
+      return AgentAuthorityVerification.refuse("requesterCannotApprove requires a DID-mode trust anchor");
+    Set<String> verified = new LinkedHashSet<>(); List<String> failures = new ArrayList<>();
+    for (ApprovalWitness w : ws) {
+      ApproverTrustAnchor.Candidates cs = expected.approvers().candidatesRestricted(w.signerDid(), w.signerPublicKey(), null);
+      if (cs.error() != null) { failures.add(cs.error()); continue; }
+      String matched = null; String last = "signature does not verify against any trusted approver key";
+      for (ApproverTrustAnchor.Candidate c : cs.list()) { last = verifyWitness(w, c.key(), receipt, opts); if (last.isEmpty()) { matched = c.identity(); break; } }
+      if (matched == null) { failures.add(last); continue; }
+      if (requirement.requireHardwareKey() && !"WEBAUTHN".equals(w.sigAlg())) { failures.add("hardware-backed WebAuthn credential required"); continue; }
+      if (requirement.requesterCannotApprove() && Objects.equals(w.signerDid(), receipt.requester().did())) { failures.add("four-eyes: requester cannot seal their own authority"); continue; }
+      verified.add(matched);
+    }
+    if (verified.size() < requirement.requiredApprovals()) return AgentAuthorityVerification.refuse("authority quorum not met: " + verified.size() + " of " + requirement.requiredApprovals() + foldFailures(failures));
+    List<String> signers = new ArrayList<>(verified); Collections.sort(signers);
+    List<String> scope = new ArrayList<>(new LinkedHashSet<>(patterns)); Collections.sort(scope);
+    return new AgentAuthorityVerification(true, null, new VerifiedAgentAuthority(expected.agentDid(), expected.target(), scope, nonce, signers, sealedAt, expiresAt));
+  }
 
   /** Just enough of the DIV Intent Payload to gate version/type and read nonce/expiry back. */
   private record CanonicalFields(
@@ -123,6 +292,12 @@ public final class Verify {
     if (classProblem != null) {
       return VerifyResult.refuse(classProblem);
     }
+    // DIV §5-step-3c. Before Local Payload Reconstruction, so an unsupported payload shape does not
+    // surface as a params mismatch.
+    String evidenceProblem = checkEvidence(receipt.canonicalPayload());
+    if (evidenceProblem != null) {
+      return VerifyResult.refuse(evidenceProblem);
+    }
 
     // Offline proofs carry challengedAt so the validity WINDOW can be bounded here, not merely at
     // mint. An unparseable expiresAt must be refused HERE rather than relying on the expiry check
@@ -178,6 +353,20 @@ public final class Verify {
     int delegatedQuorum = 0;
     if (opts.delegation() != null) {
       VerifiedDelegation d = opts.delegation();
+      OffsetDateTime delegationExpiry;
+      try {
+        delegationExpiry = OffsetDateTime.parse(d.expiresAt());
+      } catch (DateTimeParseException | NullPointerException e) {
+        return VerifyResult.refuse("delegation expiresAt is not a valid RFC3339 timestamp");
+      }
+      if (!opts.allowExpired()) {
+        Instant now = opts.asOf() != null ? opts.asOf() : Instant.now();
+        int skew = opts.clockSkewSeconds() != null ? opts.clockSkewSeconds() : Div.DEFAULT_CLOCK_SKEW_SECONDS;
+        if (now.isAfter(delegationExpiry.toInstant().plusSeconds(skew))) {
+          return VerifyResult.refuse(
+              "delegation has expired (set AllowExpired for audit re-verification)");
+        }
+      }
       if (!Objects.equals(nz(d.target()), nz(expected.target()))) {
         return VerifyResult.refuse("the delegation was issued for a different target");
       }
@@ -286,6 +475,8 @@ public final class Verify {
           witnesses.size(), Div.MAX_WITNESSES));
     }
 
+    if (fields.requirement().requesterCannotApprove() && expected.approvers().isKeySetMode())
+      return VerifyResult.refuse("requesterCannotApprove requires a DID-mode trust anchor");
     // Count DISTINCT approvers whose signature verifies under a key we independently trust.
     // Distinct is load-bearing: without it, N copies of one approver's signature satisfy an N-of-M
     // quorum.
@@ -293,7 +484,7 @@ public final class Verify {
     List<String> failures = new ArrayList<>();
     for (ApprovalWitness w : witnesses) {
       ApproverTrustAnchor.Candidates cands =
-          expected.approvers().candidatesRestricted(w.signerDid(), delegatedTo);
+          expected.approvers().candidatesRestricted(w.signerDid(), w.signerPublicKey(), delegatedTo);
       if (cands.error() != null) {
         failures.add(cands.error());
         continue;
@@ -506,7 +697,7 @@ public final class Verify {
     List<String> failures = new ArrayList<>();
     for (ApprovalWitness w : witnesses) {
       ApproverTrustAnchor.Candidates cands =
-          expected.approvers().candidatesRestricted(w.signerDid(), null);
+          expected.approvers().candidatesRestricted(w.signerDid(), w.signerPublicKey(), null);
       if (cands.error() != null) {
         failures.add(cands.error());
         continue;
@@ -567,6 +758,36 @@ public final class Verify {
    * were human-approved. "human" is the only class defined today (DIV §4.3.2). Returns null when
    * acceptable, else the refusal reason.
    */
+  /**
+   * Validate the reserved {@code evidence} field out of the signed bytes (DIV §4.3.4). REQUIRED to
+   * be present and REQUIRED to be {@code null} in v1; a non-null value is an evidence-conditioned
+   * authorization whose semantics this verifier has not been taught, and must never verify as if it
+   * were unconditioned.
+   *
+   * <p>Uses the tree model rather than {@code CanonicalFields}: {@code Records.JSON} is configured
+   * with {@code FAIL_ON_UNKNOWN_PROPERTIES=false} and maps both an absent key and an explicit null
+   * onto the same {@code null} reference, so a record component cannot express the absent-vs-null
+   * distinction this check is made of. {@code JsonNode.has} can.
+   *
+   * @return a refusal reason, or null when the field is present and null.
+   */
+  private static String checkEvidence(String canonicalPayload) {
+    com.fasterxml.jackson.databind.JsonNode payload;
+    try {
+      payload = Records.JSON.readTree(canonicalPayload);
+    } catch (Exception e) {
+      return "the signed payload is not valid JSON";
+    }
+    if (!payload.has("evidence")) {
+      return "the signed payload is missing evidence (DIV §4.3.4)";
+    }
+    if (!payload.get("evidence").isNull()) {
+      return "the signed payload declares an evidence condition, which this verifier does not"
+          + " support — refusing rather than treating it as unconditioned (DIV §4.3.4)";
+    }
+    return null;
+  }
+
   private static String checkSignerClass(ApprovalRequirement requirement) {
     String signerClass = requirement.signerClass();
     if (signerClass == null || signerClass.isEmpty()) {
@@ -654,6 +875,7 @@ public final class Verify {
     if ("WEBAUTHN".equals(w.sigAlg())) {
       return WebAuthnSupport.verifyWitness(w, trustedKey, receipt, opts);
     }
+    if (!"ES256".equals(w.sigAlg())) return "unsupported witness signature algorithm";
     // ES256: the human's key signed the canonical payload bytes directly.
     byte[] pubKeyBytes;
     try {

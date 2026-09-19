@@ -159,9 +159,9 @@ public final class IntygaClient {
     Map<String, Object> body = new LinkedHashMap<>();
     body.put("target", options.target());
     body.put("actionDescription", actionDescription);
-    // Empty string rather than JSON null when unset — the shape the Go client sends and the
-    // gateway's schema accepts.
-    body.put("actionType", options.actionType() == null ? "" : options.actionType());
+    if (options.actionType() != null) {
+      body.put("actionType", options.actionType());
+    }
     body.put("params", options.params());
     if (options.timeoutSeconds() > 0) {
       body.put("timeout", options.timeoutSeconds());

@@ -291,6 +291,10 @@ public final class Canonical {
     obj.put("actionType", nz(actionType));
     obj.put("display", nz(display));
     obj.put("params", nonNullParams(params));
+    // DIV §4.3.4. Reserved and REQUIRED in the bytes; `null` states that no external-evidence
+    // condition applied. LinkedHashMap.put, never Map.of — Map.of throws NullPointerException on a
+    // null value, and Verify's catch(RuntimeException) would turn that into an opaque refusal.
+    obj.put("evidence", null);
     obj.put("requester", common[0]);
     obj.put("requirement", common[1]);
     obj.put("nonce", nz(nonce));
@@ -322,6 +326,10 @@ public final class Canonical {
     obj.put("actionType", nz(actionType));
     obj.put("display", nz(display));
     obj.put("params", nonNullParams(params));
+    // DIV §4.3.4. Reserved and REQUIRED in the bytes; `null` states that no external-evidence
+    // condition applied. LinkedHashMap.put, never Map.of — Map.of throws NullPointerException on a
+    // null value, and Verify's catch(RuntimeException) would turn that into an opaque refusal.
+    obj.put("evidence", null);
     obj.put("requester", common[0]);
     obj.put("requirement", common[1]);
     obj.put("nonce", nz(nonce));

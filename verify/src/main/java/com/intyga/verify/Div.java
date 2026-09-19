@@ -19,6 +19,12 @@ public final class Div {
    */
   public static final String DELEGATION_TYPE = "div-delegation";
 
+  /** Standing, quorum-sealed agent scope. It is governance evidence, never an approval. */
+  public static final String AGENT_AUTHORITY_TYPE = "div-agent-authority";
+
+  /** Platform subject hash-only WebAuthn intent (DIV §5c). */
+  public static final String PLATFORM_INTENT_TYPE = "div-platform-intent";
+
   /** RECOMMENDED expiry tolerance (DIV §6.2). */
   public static final int DEFAULT_CLOCK_SKEW_SECONDS = 30;
 

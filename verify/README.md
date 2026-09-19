@@ -44,7 +44,7 @@ if (!res.ok()) {
 
 A receipt arrives from the client as raw JSON; `ApprovalReceipt.parse(...)` accepts either a `String` or the `JsonNode` that `com.intyga.sdk.ApprovalResult.receipt()` returns.
 
-**One-approver-per-key caveat.** In public-keys mode the identity IS the key, so an M-of-N quorum counts credentials, not people: one approver whose two registered credentials are both listed satisfies a 2-of-N alone. The same limitation weakens `requesterCannotApprove`: the witness's `signerDid` is an unverified string in this mode, so a requester holding a listed key can evade the four-eyes exclusion by naming a different `signerDid`. For `requiredApprovals` > 1 — or whenever four-eyes matters — use the DID/identity form (`ApproverTrustAnchor.ofDidsMultiKey`), which counts distinct approvers (DIV §4.4.6). Delegation verification goes further and **refuses** a public-keys anchor outright — see below.
+**One-approver-per-key caveat.** In public-keys mode the identity IS the key, so an M-of-N quorum counts credentials, not people: one approver whose two registered credentials are both listed satisfies a 2-of-N alone. A signed `requesterCannotApprove` rule requires DID/identity trust; key-only anchors are refused because `signerDid` is unverified in that mode. For `requiredApprovals` > 1, use the DID/identity form (`ApproverTrustAnchor.ofDidsMultiKey`), which counts distinct approvers (DIV §4.4.6). Delegation verification goes further and **refuses** a public-keys anchor outright — see below.
 
 One byte of drift — a swapped target, an appended region — and verification fails, because the signature was over the exact bytes you just recomputed.
 
@@ -71,22 +71,30 @@ VerifyOptions opts = VerifyOptions.builder()
 
 ## DEWP conformance
 
-This port implements the **DEWP Core primitives** ([`docs/DEWP.md`](../../docs/DEWP.md) §9.1): domain-separated hashing (`0x00`/`0x01`/`0x02`/`0x03`), two-tier Merkle tree construction with duplicate-last balancing, leaf-to-root inclusion proof verification **bounded by leaf position** (§11.1), the `trust.intyga.audit.v1` canonical preimage, the `0x03` anchor digest, and **anchor signature (single-anchor, ES256)** over the raw 32-byte digest. Byte parity with the TypeScript reference is locked by `packages/mcp-schemas/vectors/ledger-vectors.json`.
+This port implements the TypeScript verifier's in-memory DEWP surface: the Core primitives,
+single-proof and evidence-bundle JSON readers, the §7.1 verification properties and levels,
+embedded ES256 verification, gapless committed `tenantSeq` validation, the `0x04` checkpoint
+continuity chain, and anchor quorum for ES256, Ed25519, RSA-PSS, and caller-pinned Rekor SET
+evidence. Byte parity is pinned by the shared vectors in `packages/mcp-schemas/vectors/`.
 
-It does **not** implement, and a caller should not assume:
+Additional receipt APIs and remaining limits:
 
-- **Anchor quorum verification** (§5.3). Single-anchor ES256 signature checking is provided; Ed25519/RSA-PSS anchors, evaluating `requiredAnchors` / issuer trust and divergence detection are not. `anchorVerified` therefore cannot be established by this port alone.
-- **Proof bundle parsing and the §7.1 verification levels.** This port verifies proofs, not envelopes.
-- **Evidence bundles, `tenantSeq` gapless validation, and NDJSON streaming** (§9.2 Extended Profile).
-- **The §5.4 checkpoint continuity chain (`0x04` domain tag).** Roots-file transport, outside Core (DEWP §9.1); implemented by the TypeScript verifier only.
+- **NDJSON evidence streaming** (§6.4). The TypeScript reference also does not implement it, so
+  no implementation currently claims the complete §9.2 Extended Profile.
 - **DIV §4.4.4 verification-code derivation.** The short display code is a human-factors aid that MUST NOT be treated as authentication, so this port carries `verificationCode` as an unvalidated field (TypeScript and Python assert those vectors).
-- **DIV §5b Agent Authority** (`div-agent-authority` payloads). TypeScript-only. This port's approval verifier correctly REFUSES the payload type — an authority authorizes no action — it just cannot verify one as governance evidence.
-- **DIV §5c Platform Hash-Only Intent** (`div-platform-intent` payloads and the `platformIntentPayloads` vector section). TypeScript-only. This port's approval verifier correctly REFUSES the payload type (pinned by the `platform-intent-refused-by-approval-verifier` receipt fixture) — §5c requires a separate `verifyPlatformReceipt` entry point — it just cannot verify one.
+- **DIV §5b Agent Authority** is verified separately with `Verify.verifyAgentAuthority`; the
+  ordinary approval verifier continues to refuse it because a scope grant approves no action.
+- **DIV §5c Platform Hash-Only Intent** is verified separately with
+  `Verify.verifyPlatformReceipt`, including mandatory WebAuthn origin/RP binding.
 - **The document-signing payload** (`canonicalDocumentPayload`). This port carries no document canonicalization and does not assert the `documentPayloads` vector section — as `verify-go`, `verify-rust` and `sdk-python` also deliberately do not: the section's own note marks it TS-only (document signing is a gateway-side ceremony, not part of the relying-party offline surface). Approval and ledger canonicalization are unaffected — it is document *signing* that is out of scope here.
 
 One further precision about the portable-number rule (DEWP §4.3.1). This port refuses a non-portable number rather than best-effort serializing it, like `verify-go` — with a single exception it is not able to see: Jackson normalizes an integer-form `-0` to `0` while parsing, so the sign is gone before the check runs and that one value is serialized as `0`. The float form `-0.0` is refused correctly. No conformant producer emits either (JavaScript's `JSON.stringify(-0)` is already `"0"`, and the reference producer refuses at ingestion), so this is reachable only from a hand-authored or foreign document. The spec permits both responses, so the behaviour is conformant either way; it is stated here because "refuses" would otherwise be very slightly overclaiming.
 
-For the rest of the surface — signed multi-anchor quorum, evidence bundles, gapless `tenantSeq` completeness over committed events, and the four-property verification model — use the TypeScript verifier (`@intyga/verify`). Note that no implementation, the TypeScript one included, currently claims the §9.2 **Extended Profile**: it also requires NDJSON evidence streaming (§6.4), which is specified but not yet implemented anywhere.
+Use `Dewp.verifyBundle` for one proof and `Dewp.verifyEvidenceBundle` for a multi-entry audit export.
+Both require caller-supplied roots for a trustworthy verdict; quorum keys likewise come from the
+caller's policy, never the bundle. Bundle-carried anchors cannot establish divergence; use the
+checkpoint-keyed caller anchor map for that. RFC 3161/CMS and WEBHOOK evidence do not count toward
+quorum. Authority verification checks the seal but cannot discover later online revocation.
 
 ## Also available in
 - TypeScript — [`@intyga/verify`](https://github.com/intyga-dev/verify)
