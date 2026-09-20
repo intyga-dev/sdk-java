@@ -283,6 +283,13 @@ public final class Canonical {
       ApprovalRequirement requirement,
       String nonce,
       String expiresAt) {
+    return canonicalIntentPayload(target, actionType, display, params, requester, requirement, nonce, expiresAt, null);
+  }
+
+  public static String canonicalIntentPayload(
+      String target, String actionType, String display, Map<String, Object> params,
+      RequesterIdentity requester, ApprovalRequirement requirement, String nonce,
+      String expiresAt, Map<String, Object> agentContext) {
     Map<String, Object>[] common = canonicalCommon(requester, requirement);
     Map<String, Object> obj = new LinkedHashMap<>();
     obj.put("v", Div.VERSION);
@@ -298,7 +305,15 @@ public final class Canonical {
     obj.put("requester", common[0]);
     obj.put("requirement", common[1]);
     obj.put("nonce", nz(nonce));
-    obj.put("expiresAt", nz(expiresAt));
+    if (agentContext == null) {
+      obj.put("expiresAt", nz(expiresAt));
+    } else {
+      obj.put("action", agentContext.get("action"));
+      obj.put("agent", agentContext.get("agent"));
+      obj.put("session", agentContext.get("session"));
+      obj.put("nbf", agentContext.get("nbf"));
+      obj.put("exp", nz(expiresAt));
+    }
     return stableStringify(obj);
   }
 

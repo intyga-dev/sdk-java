@@ -15,4 +15,10 @@ public record Expected(
     String nonce,
     String actionType,
     Map<String, Object> params,
-    ApproverTrustAnchor approvers) {}
+    ApproverTrustAnchor approvers,
+    Map<String, Object> agentContext) {
+  public Expected(String target, String nonce, String actionType, Map<String, Object> params,
+      ApproverTrustAnchor approvers) {
+    this(target, nonce, actionType, params, approvers, null);
+  }
+}

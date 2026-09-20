@@ -4,8 +4,11 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneOffset;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeParseException;
+import java.time.format.DateTimeFormatter;
+import java.text.Normalizer;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
@@ -22,6 +25,61 @@ import java.util.LinkedHashMap;
  * signature against a key the caller resolved — no Intyga secret, no network.
  */
 public final class Verify {
+
+  private static final DateTimeFormatter AGENT_TIME = DateTimeFormatter
+      .ofPattern("uuuu-MM-dd'T'HH:mm:ss.SSS'Z'").withZone(ZoneOffset.UTC);
+
+  private static boolean agentDigest(Object value) {
+    return value instanceof String s && s.matches("sha256:[0-9a-f]{64}");
+  }
+
+  private static boolean agentMoney(Object value) {
+    if (!(value instanceof Map<?, ?> m)) return false;
+    return m.get("amount") instanceof String amount
+        && amount.matches("(?:0|[1-9][0-9]{0,29})(?:\\.[0-9]{1,9})?")
+        && m.get("currency") instanceof String currency && currency.matches("[A-Z]{3}");
+  }
+
+  private static String validateAgentContext(Map<String, Object> context, String exp, String sigAlg) {
+    if (!(context.get("action") instanceof Map<?, ?> action)
+        || !("reversible".equals(action.get("reversibility")) || "irreversible".equals(action.get("reversibility"))))
+      return "invalid agent action reversibility";
+    if (!(context.get("agent") instanceof Map<?, ?> agent)
+        || !(agent.get("label") instanceof String label) || label.isEmpty() || label.length() > 200
+        || !agentDigest(agent.get("configDigest"))) return "invalid agent identity or configuration digest";
+    if (!(context.get("session") instanceof Map<?, ?> session)) return "invalid agent session identity or sequence";
+    if (!Normalizer.isNormalized(label, Normalizer.Form.NFC)
+        || !(session.get("id") instanceof String id) || !Normalizer.isNormalized(id, Normalizer.Form.NFC))
+      return "agent labels and session identifiers must be NFC";
+    if (!agent.containsKey("delegatedBy") || (agent.get("delegatedBy") != null && !agentDigest(agent.get("delegatedBy"))))
+      return "invalid parent authority digest";
+    if (!agentDigest(session.get("id")) || !(session.get("seq") instanceof String seq)
+        || !seq.matches("[1-9][0-9]{0,17}")) return "invalid agent session identity or sequence";
+    Object prev = session.get("prev");
+    if (!session.containsKey("prev") || ("1".equals(seq)) != (prev == null) || (prev != null && !agentDigest(prev)))
+      return "invalid agent session predecessor";
+    Object amount = action.get("amount"), aggregate = session.get("aggregate");
+    if (!action.containsKey("amount") || !session.containsKey("aggregate")) return "invalid agent monetary amount";
+    if ((amount != null && !agentMoney(amount)) || (aggregate != null && !agentMoney(aggregate)))
+      return "invalid agent monetary amount";
+    if ((amount == null) != (aggregate == null)
+        || (amount instanceof Map<?, ?> a && aggregate instanceof Map<?, ?> b
+            && !Objects.equals(a.get("currency"), b.get("currency"))))
+      return "agent monetary amount and aggregate disagree";
+    try {
+      if (!(context.get("nbf") instanceof String nbf)
+          || !nbf.matches("[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z")
+          || !exp.matches("[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z"))
+        return "agent intent must use canonical UTC times within five minutes";
+      Instant from = Instant.parse(nbf), to = Instant.parse(exp);
+      if (!AGENT_TIME.format(from).equals(nbf) || !AGENT_TIME.format(to).equals(exp)
+          || !to.isAfter(from) || Duration.between(from, to).toMillis() > 300_000)
+        return "agent intent must use canonical UTC times within five minutes";
+    } catch (RuntimeException e) { return "agent intent must use canonical UTC times within five minutes"; }
+    if ("irreversible".equals(action.get("reversibility")) && "AUTO_APPROVED".equals(sigAlg))
+      return "irreversible agent action requires a human signature";
+    return null;
+  }
 
   /** Byte-identical DIV §5c canonical platform intent. */
   public static String canonicalPlatformIntentPayload(
@@ -40,6 +98,14 @@ public final class Verify {
       String target, List<String> actionPatterns, String display, String agentDid,
       RequesterIdentity requester, ApprovalRequirement requirement,
       String nonce, String sealedAt, String expiresAt) {
+    return canonicalAgentAuthorityPayload(target, actionPatterns, display, agentDid, requester,
+        requirement, nonce, sealedAt, expiresAt, null);
+  }
+
+  public static String canonicalAgentAuthorityPayload(
+      String target, List<String> actionPatterns, String display, String agentDid,
+      RequesterIdentity requester, ApprovalRequirement requirement,
+      String nonce, String sealedAt, String expiresAt, String parentReceiptHash) {
     List<String> patterns = new ArrayList<>(actionPatterns); Collections.sort(patterns);
     List<String> aaguids = new ArrayList<>(requirement.allowedAaguids()); Collections.sort(aaguids);
     Map<String, Object> req = new LinkedHashMap<>();
@@ -53,6 +119,7 @@ public final class Verify {
     Map<String, Object> m = new LinkedHashMap<>();
     m.put("v", Div.VERSION); m.put("type", Div.AGENT_AUTHORITY_TYPE); m.put("target", target);
     m.put("actionPatterns", patterns); m.put("display", display); m.put("agent", Map.of("did", agentDid));
+    m.put("parentReceiptHash", parentReceiptHash);
     m.put("requester", requesterMap); m.put("requirement", req); m.put("nonce", nonce);
     m.put("sealedAt", sealedAt); m.put("expiresAt", expiresAt);
     return Canonical.stableStringify(m);
@@ -150,6 +217,14 @@ public final class Verify {
     if (!p.path("actionPatterns").isArray()) return AgentAuthorityVerification.refuse("authority is missing a valid actionPatterns set");
     for (com.fasterxml.jackson.databind.JsonNode n : p.path("actionPatterns")) { if (!n.isTextual() || n.asText().isEmpty()) return AgentAuthorityVerification.refuse("authority is missing a valid actionPatterns set"); patterns.add(n.asText()); }
     if (patterns.isEmpty()) return AgentAuthorityVerification.refuse("authority is missing a valid actionPatterns set");
+    com.fasterxml.jackson.databind.JsonNode parentNode = p.get("parentReceiptHash");
+    if (parentNode == null) return AgentAuthorityVerification.refuse("authority is missing parentReceiptHash");
+    String parentReceiptHash = null;
+    if (!parentNode.isNull()) {
+      if (!parentNode.isTextual() || !parentNode.asText().matches("sha256:[0-9a-f]{64}"))
+        return AgentAuthorityVerification.refuse("authority has invalid parentReceiptHash");
+      parentReceiptHash = parentNode.asText();
+    }
     String sealedAt = p.path("sealedAt").asText(""); String expiresAt = p.path("expiresAt").asText(""); String nonce = p.path("nonce").asText("");
     Instant sealed; Instant expiry;
     try { sealed = Instant.parse(sealedAt); } catch (Exception e) { return AgentAuthorityVerification.refuse("sealedAt is not a valid RFC3339 timestamp"); }
@@ -166,7 +241,7 @@ public final class Verify {
     String classProblem = checkSignerClass(requirement); if (classProblem != null) return AgentAuthorityVerification.refuse(classProblem);
     if (expected == null || isEmpty(expected.target()) || isEmpty(expected.agentDid()) || expected.approvers() == null)
       return AgentAuthorityVerification.refuse("expected target, agentDid and approvers are required");
-    String rebuilt = canonicalAgentAuthorityPayload(expected.target(), patterns, receipt.actionDescription(), expected.agentDid(), receipt.requester(), requirement, nonce, sealedAt, expiresAt);
+    String rebuilt = canonicalAgentAuthorityPayload(expected.target(), patterns, receipt.actionDescription(), expected.agentDid(), receipt.requester(), requirement, nonce, sealedAt, expiresAt, parentReceiptHash);
     if (!rebuilt.equals(receipt.canonicalPayload())) return AgentAuthorityVerification.refuse("target/agent/actionPatterns do not match what was sealed");
     if ("AUTO_APPROVED".equals(receipt.sigAlg())) return AgentAuthorityVerification.refuse("an agent authority cannot be auto-approved");
     List<ApprovalWitness> ws = witnessesOf(receipt); if (ws.isEmpty()) return AgentAuthorityVerification.refuse("authority missing signature material");
@@ -187,7 +262,7 @@ public final class Verify {
     if (verified.size() < requirement.requiredApprovals()) return AgentAuthorityVerification.refuse("authority quorum not met: " + verified.size() + " of " + requirement.requiredApprovals() + foldFailures(failures));
     List<String> signers = new ArrayList<>(verified); Collections.sort(signers);
     List<String> scope = new ArrayList<>(new LinkedHashSet<>(patterns)); Collections.sort(scope);
-    return new AgentAuthorityVerification(true, null, new VerifiedAgentAuthority(expected.agentDid(), expected.target(), scope, nonce, signers, sealedAt, expiresAt));
+    return new AgentAuthorityVerification(true, null, new VerifiedAgentAuthority(expected.agentDid(), expected.target(), scope, nonce, signers, sealedAt, expiresAt, parentReceiptHash));
   }
 
   /** Just enough of the DIV Intent Payload to gate version/type and read nonce/expiry back. */
@@ -196,6 +271,8 @@ public final class Verify {
       String type,
       String nonce,
       String expiresAt,
+      String exp,
+      com.fasterxml.jackson.databind.JsonNode agent,
       String challengedAt,
       String sealedAt,
       List<String> delegatedTo,
@@ -262,8 +339,27 @@ public final class Verify {
     if (receipt.requester() == null) {
       return VerifyResult.refuse("receipt missing requester");
     }
-    if (isEmpty(fields.expiresAt())) {
-      return VerifyResult.refuse("receipt missing expiresAt");
+    boolean agentIntent = fields.agent() != null;
+    if (agentIntent != (expected.agentContext() != null))
+      return VerifyResult.refuse("agent receipt requires independently asserted PEP context");
+    String expiresAt = agentIntent ? fields.exp() : fields.expiresAt();
+    if (isEmpty(expiresAt)) {
+      return VerifyResult.refuse("receipt missing expiration");
+    }
+    if (agentIntent) {
+      String contextProblem = validateAgentContext(expected.agentContext(), expiresAt, receipt.sigAlg());
+      if (contextProblem != null) return VerifyResult.refuse("invalid independently asserted agent context: " + contextProblem);
+      Object nestedAgent = expected.agentContext().get("agent");
+      if (nestedAgent instanceof Map<?, ?> agentMap && agentMap.get("delegatedBy") != null)
+        return VerifyResult.refuse("delegated agent receipt requires a trusted root-to-leaf authority chain");
+      try {
+        Object rawNbf = expected.agentContext().get("nbf");
+        if (!(rawNbf instanceof String nbf)) return VerifyResult.refuse("invalid agent nbf");
+        Instant from = Instant.parse(nbf), to = Instant.parse(expiresAt);
+        Instant now = opts.asOf() == null ? Instant.now() : opts.asOf();
+        long skew = opts.clockSkewSeconds() == null ? Div.DEFAULT_CLOCK_SKEW_SECONDS : opts.clockSkewSeconds();
+        if (from.isAfter(now.plusSeconds(skew))) return VerifyResult.refuse("agent approval is not valid yet");
+      } catch (RuntimeException e) { return VerifyResult.refuse("invalid agent validity window"); }
     }
     // Both fail closed, as verifyDelegation already does for the target: an absent target would be
     // canonicalized as "" and let a receipt minted for another service verify here, and an absent
@@ -316,7 +412,7 @@ public final class Verify {
       }
       OffsetDateTime expiry;
       try {
-        expiry = OffsetDateTime.parse(fields.expiresAt());
+        expiry = OffsetDateTime.parse(expiresAt);
       } catch (DateTimeParseException e) {
         return VerifyResult.refuse("expiresAt is not a valid RFC3339 timestamp");
       }
@@ -409,7 +505,7 @@ public final class Verify {
             fields.requirement(),
             fields.nonce(),
             fields.challengedAt(),
-            fields.expiresAt());
+            expiresAt);
       } else {
         recomputed = Canonical.canonicalIntentPayload(
             expected.target(),
@@ -419,7 +515,8 @@ public final class Verify {
             receipt.requester(),
             fields.requirement(),
             fields.nonce(),
-            fields.expiresAt());
+            expiresAt,
+            agentIntent ? expected.agentContext() : null);
       }
     } catch (Canonical.NonPortableValueException e) {
       // Almost always expected.params carrying a non-portable number. Deliberately DISTINCT from
@@ -435,7 +532,7 @@ public final class Verify {
     if (!opts.allowExpired()) {
       OffsetDateTime expiry;
       try {
-        expiry = OffsetDateTime.parse(fields.expiresAt());
+        expiry = OffsetDateTime.parse(expiresAt);
       } catch (DateTimeParseException e) {
         return VerifyResult.refuse("expiresAt is not a valid RFC3339 timestamp");
       }

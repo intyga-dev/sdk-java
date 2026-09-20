@@ -9,6 +9,7 @@ public final class AuthorizeOptions {
   private final String target;
   private final String actionType;
   private final Map<String, Object> params;
+  private final Map<String, Object> agentContext;
   private final int timeoutSeconds;
 
   private AuthorizeOptions(Builder b) {
@@ -17,6 +18,7 @@ public final class AuthorizeOptions {
     // Not Map.copyOf: params may carry JSON nulls, and insertion order should survive to the
     // approver's screen.
     this.params = Collections.unmodifiableMap(new LinkedHashMap<>(b.params));
+    this.agentContext = b.agentContext == null ? null : Collections.unmodifiableMap(new LinkedHashMap<>(b.agentContext));
     this.timeoutSeconds = b.timeoutSeconds;
   }
 
@@ -36,6 +38,7 @@ public final class AuthorizeOptions {
     b.target = target;
     b.actionType = actionType;
     b.params = new LinkedHashMap<>(params);
+    b.agentContext = agentContext == null ? null : new LinkedHashMap<>(agentContext);
     b.timeoutSeconds = timeoutSeconds;
     return b;
   }
@@ -64,6 +67,8 @@ public final class AuthorizeOptions {
     return params;
   }
 
+  public Map<String, Object> agentContext() { return agentContext; }
+
   /** Optional override of the server's default challenge TTL; 0 means unset (not sent). */
   public int timeoutSeconds() {
     return timeoutSeconds;
@@ -73,6 +78,7 @@ public final class AuthorizeOptions {
     private String target;
     private String actionType;
     private Map<String, Object> params = new LinkedHashMap<>();
+    private Map<String, Object> agentContext;
     private int timeoutSeconds;
 
     private Builder() {}
@@ -89,6 +95,11 @@ public final class AuthorizeOptions {
 
     public Builder params(Map<String, Object> params) {
       this.params = params == null ? new LinkedHashMap<>() : new LinkedHashMap<>(params);
+      return this;
+    }
+
+    public Builder agentContext(Map<String, Object> context) {
+      this.agentContext = context == null ? null : new LinkedHashMap<>(context);
       return this;
     }
 

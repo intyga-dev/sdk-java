@@ -10,4 +10,5 @@ public record VerifiedAgentAuthority(
     String nonce,
     List<String> signers,
     String sealedAt,
-    String expiresAt) {}
+    String expiresAt,
+    String parentReceiptHash) {}

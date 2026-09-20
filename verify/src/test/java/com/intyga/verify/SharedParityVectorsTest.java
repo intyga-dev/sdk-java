@@ -63,7 +63,8 @@ final class SharedParityVectorsTest {
       List<String> publicKeys = new ArrayList<>();
       expected.path("approverKeyIds").forEach(id -> publicKeys.add(keyById.get(id.asText()).path("spkiB64").asText()));
       Map<String,Object> params = Records.JSON.convertValue(expected.path("params"), new com.fasterxml.jackson.core.type.TypeReference<Map<String,Object>>() {});
-      Expected e = new Expected(expected.path("target").asText(), expected.path("nonce").asText(), expected.path("actionType").asText(), params, ApproverTrustAnchor.ofPublicKeys(publicKeys));
+      Map<String,Object> agentContext = expected.has("agentContext") ? Records.JSON.convertValue(expected.path("agentContext"), new com.fasterxml.jackson.core.type.TypeReference<Map<String,Object>>() {}) : null;
+      Expected e = new Expected(expected.path("target").asText(), expected.path("nonce").asText(), expected.path("actionType").asText(), params, ApproverTrustAnchor.ofPublicKeys(publicKeys), agentContext);
       var result = Verify.verifyApprovalReceipt(ApprovalReceipt.parse(c.path("receipt")), e,
           options(merge(v.path("approvals").path("options"), c.get("options"))));
       assertEquals(c.path("ok").asBoolean(), result.ok(), c.path("name").asText() + ": " + result.reason());
@@ -178,7 +179,18 @@ final class SharedParityVectorsTest {
     catch (IOException e) { throw new IllegalStateException(e); }
     for (JsonNode item : v.path("agentAuthorityPayloads")) {
       JsonNode i = item.path("input");
-      String got = Verify.canonicalAgentAuthorityPayload(i.path("target").asText(), Records.JSON.convertValue(i.path("actionPatterns"), new com.fasterxml.jackson.core.type.TypeReference<List<String>>() {}), i.path("actionDescription").asText(), i.path("agentDid").asText(), Records.JSON.convertValue(i.path("requester"), RequesterIdentity.class), Records.JSON.convertValue(i.path("requirement"), ApprovalRequirement.class), i.path("nonce").asText(), i.path("sealedAt").asText(), i.path("expiresAt").asText());
+      String got = Verify.canonicalAgentAuthorityPayload(i.path("target").asText(), Records.JSON.convertValue(i.path("actionPatterns"), new com.fasterxml.jackson.core.type.TypeReference<List<String>>() {}), i.path("actionDescription").asText(), i.path("agentDid").asText(), Records.JSON.convertValue(i.path("requester"), RequesterIdentity.class), Records.JSON.convertValue(i.path("requirement"), ApprovalRequirement.class), i.path("nonce").asText(), i.path("sealedAt").asText(), i.path("expiresAt").asText(), i.path("parentReceiptHash").isNull() ? null : i.path("parentReceiptHash").asText());
+      assertEquals(item.path("expected").asText(), got);
+    }
+    for (JsonNode item : v.path("agentIntentPayloads")) {
+      JsonNode i = item.path("input");
+      String got = Canonical.canonicalIntentPayload(
+          i.path("target").asText(), i.path("actionType").asText(), i.path("actionDescription").asText(),
+          Records.JSON.convertValue(i.path("params"), new com.fasterxml.jackson.core.type.TypeReference<Map<String, Object>>() {}),
+          Records.JSON.convertValue(i.path("requester"), RequesterIdentity.class),
+          Records.JSON.convertValue(i.path("requirement"), ApprovalRequirement.class),
+          i.path("nonce").asText(), i.path("expiresAt").asText(),
+          Records.JSON.convertValue(i.path("agentContext"), new com.fasterxml.jackson.core.type.TypeReference<Map<String, Object>>() {}));
       assertEquals(item.path("expected").asText(), got);
     }
     for (JsonNode item : v.path("platformIntentPayloads").path("cases")) {

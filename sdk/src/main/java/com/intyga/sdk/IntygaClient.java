@@ -163,6 +163,7 @@ public final class IntygaClient {
       body.put("actionType", options.actionType());
     }
     body.put("params", options.params());
+    if (options.agentContext() != null) body.put("agentContext", options.agentContext());
     if (options.timeoutSeconds() > 0) {
       body.put("timeout", options.timeoutSeconds());
     }

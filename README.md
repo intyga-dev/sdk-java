@@ -2,6 +2,10 @@
 
 Gate any high-risk backend action behind a real human approval. The primitive is uniform: **request a challenge → a human approves with a passkey or security key → poll until resolved** — the same client works for scripts, pipelines, and AI agents.
 
+The example below uses a human or `SERVICE` key. `AI_AGENT` keys must pass
+`AuthorizeOptions.agentContext(...)`; the executing service must independently check live
+configuration, the signed session sequence and aggregate, and a budget across sessions (DIV §4.3.6).
+
 This package **bundles the offline verifier** ([`com.intyga:intyga-verify`](https://github.com/intyga-dev/verify-java)), so you can request an approval *and* independently verify the receipt without adding a second dependency.
 
 > Status: **not yet published** to Maven Central. Until then, build from source: `mvn install` at
@@ -74,7 +78,8 @@ if (!c.ok()) {
 }
 ```
 
-Works identically whether the token is a **human key** (backend/service) or an **agent key** — Intyga is a general zero-trust gate for *any* backend action, not just agents.
+Agent receipts add signed continuity context; use the agent context expected by your service when
+verifying them. A configuration digest is an RP claim, not an agent integrity attestation.
 
 For framework code (a Spring/Quarkus handler, a LangChain4j tool method), `requireApprovalOrThrow(...)` is the one-line form: any outcome other than APPROVED throws `ApprovalRefusedException`, so a refusal propagates as an exception and can never be mistaken for a successful result.
 
@@ -82,7 +87,7 @@ For framework code (a Spring/Quarkus handler, a LangChain4j tool method), `requi
 
 ## Offline verification
 
-`ApprovalResult.receipt()` is the signed receipt as raw JSON (`JsonNode`); `ApprovalReceipt.parse(...)` turns it into a verifier receipt with no re-serialization. The verifier implements the **DEWP Core Profile** — the same scope as `verify-go` and `verify-rust`, not the full TypeScript surface. `packages/verify-java`'s README states exactly what it does and does not verify (no anchor-quorum evaluation, no bundle parsing, no agent-authority payloads); read it before relying on a property it does not establish.
+`ApprovalResult.receipt()` is the signed receipt as raw JSON (`JsonNode`); `ApprovalReceipt.parse(...)` turns it into a verifier receipt with no re-serialization. `packages/verify-java`'s README states exactly what it verifies; read it before relying on a property it does not establish.
 
 ## API
 
