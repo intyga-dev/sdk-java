@@ -53,22 +53,18 @@ class CanonicalBackstopTest {
   }
 
   @Test
-  void escapesLoneSurrogatesButNotValidPairs() {
-    // ES2019 well-formed JSON.stringify, which the TS reference delegates to, escapes an unpaired
-    // surrogate and leaves a valid pair raw. Appending a lone surrogate raw would make Java a
-    // fourth answer (getBytes(UTF_8) turns it into '?'), so a receipt carrying one would verify
-    // nowhere else.
-    Map<String, Object> lone = new LinkedHashMap<>();
-    lone.put("a", "\uD800");
-    assertEquals("{\"a\":\"\\ud800\"}", Canonical.stableStringify(lone));
-
-    Map<String, Object> loneLow = new LinkedHashMap<>();
-    loneLow.put("a", "\uDC00");
-    assertEquals("{\"a\":\"\\udc00\"}", Canonical.stableStringify(loneLow));
-
-    Map<String, Object> trailing = new LinkedHashMap<>();
-    trailing.put("a", "\uD800a");
-    assertEquals("{\"a\":\"\\ud800a\"}", Canonical.stableStringify(trailing));
+  void refusesLoneSurrogatesButNotValidPairs() {
+    // RFC 8785 builds on I-JSON, which forbids an unpaired surrogate (DIV §4.1). Escaping it as
+    // the TS reference used to do made a receipt carrying one verify in some ports only; every
+    // port now refuses it, in values and in member names alike.
+    for (String bad : List.of("\uD800", "\uDC00", "\uD800a", "a\uDBFF")) {
+      Map<String, Object> value = new LinkedHashMap<>();
+      value.put("a", bad);
+      assertThrows(Canonical.NonPortableValueException.class, () -> Canonical.stableStringify(value));
+      Map<String, Object> key = new LinkedHashMap<>();
+      key.put(bad, 1);
+      assertThrows(Canonical.NonPortableValueException.class, () -> Canonical.stableStringify(key));
+    }
 
     // A well-formed pair stays literal — escaping it would break every emoji in an approval.
     Map<String, Object> pair = new LinkedHashMap<>();

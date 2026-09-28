@@ -165,8 +165,8 @@ public final class Verify {
     String canonical = canonicalPlatformIntentPayload(expected.payloadHash(), expected.rpId(), subject, signedAt, expiresAt, expected.nonce());
     if (!canonical.equals(receipt.canonicalPayload())) return PlatformVerification.refuse("payloadHash/rpId do not match what was signed");
     Instant signed; Instant expiry;
-    try { signed = Instant.parse(signedAt); } catch (Exception e) { return PlatformVerification.refuse("signedAt is not a valid RFC3339 timestamp"); }
-    try { expiry = Instant.parse(expiresAt); } catch (Exception e) { return PlatformVerification.refuse("expiresAt is not a valid RFC3339 timestamp"); }
+    try { signed = SignedTime.parse(signedAt).toInstant(); } catch (Exception e) { return PlatformVerification.refuse("signedAt is not a valid RFC3339 timestamp"); }
+    try { expiry = SignedTime.parse(expiresAt).toInstant(); } catch (Exception e) { return PlatformVerification.refuse("expiresAt is not a valid RFC3339 timestamp"); }
     if (expiry.isBefore(signed)) return PlatformVerification.refuse("receipt expires before it was signed");
     Instant now = opts.asOf() == null ? Instant.now() : opts.asOf();
     long skew = opts.clockSkewSeconds() == null ? Div.DEFAULT_CLOCK_SKEW_SECONDS : opts.clockSkewSeconds();
@@ -180,15 +180,24 @@ public final class Verify {
     if (ws.isEmpty()) return PlatformVerification.refuse("receipt missing signature material");
     if (ws.size() > Div.MAX_WITNESSES) return PlatformVerification.refuse("receipt carries too many witnesses");
     VerifyOptions effective = VerifyOptions.builder().expectedOrigin(opts.expectedOrigin()).expectedRpId(expected.rpId())
-        .requireUserVerification(opts.requireUserVerification() == null || opts.requireUserVerification())
+        // User verification is UNCONDITIONAL on this plane (DIV §5c.3): the ordinary-receipt waiver
+        // requireUserVerification(false) is overridden here, never honoured.
+        .requireUserVerification(true)
         .allowCrossOrigin(opts.allowCrossOrigin()).asOf(now).clockSkewSeconds((int) skew).build();
-    Set<String> verified = new LinkedHashSet<>(); List<String> failures = new ArrayList<>();
+    Set<String> verified = new LinkedHashSet<>(); Map<String, String> countedKeys = new LinkedHashMap<>(); List<String> failures = new ArrayList<>();
     for (ApprovalWitness w : ws) {
       if (!"WEBAUTHN".equals(w.sigAlg())) { failures.add("signer " + w.signerDid() + " used a bare key; platform receipts are WebAuthn-only"); continue; }
       ApproverTrustAnchor.Candidates cs = expected.approvers().candidatesRestricted(w.signerDid(), w.signerPublicKey(), null);
       if (cs.error() != null) { failures.add(cs.error()); continue; }
       boolean ok = false; String last = "signature does not verify against any trusted subject key";
-      for (ApproverTrustAnchor.Candidate c : cs.list()) { last = verifyWitness(w, c.key(), ar, effective); if (last.isEmpty()) { verified.add(c.identity()); ok = true; break; } }
+      for (ApproverTrustAnchor.Candidate c : cs.list()) {
+        last = verifyWitness(w, c.key(), ar, effective);
+        if (last.isEmpty()) {
+          String shared = sharedKeyProblem(countedKeys, c.key(), c.identity());
+          if (shared == null) { verified.add(c.identity()); ok = true; } else { last = shared; }
+          break;
+        }
+      }
       if (!ok) failures.add(last);
     }
     if (verified.isEmpty()) return PlatformVerification.refuse("no valid subject signature" + foldFailures(failures));
@@ -227,8 +236,8 @@ public final class Verify {
     }
     String sealedAt = p.path("sealedAt").asText(""); String expiresAt = p.path("expiresAt").asText(""); String nonce = p.path("nonce").asText("");
     Instant sealed; Instant expiry;
-    try { sealed = Instant.parse(sealedAt); } catch (Exception e) { return AgentAuthorityVerification.refuse("sealedAt is not a valid RFC3339 timestamp"); }
-    try { expiry = Instant.parse(expiresAt); } catch (Exception e) { return AgentAuthorityVerification.refuse("expiresAt is not a valid RFC3339 timestamp"); }
+    try { sealed = SignedTime.parse(sealedAt).toInstant(); } catch (Exception e) { return AgentAuthorityVerification.refuse("sealedAt is not a valid RFC3339 timestamp"); }
+    try { expiry = SignedTime.parse(expiresAt).toInstant(); } catch (Exception e) { return AgentAuthorityVerification.refuse("expiresAt is not a valid RFC3339 timestamp"); }
     if (expiry.isBefore(sealed)) return AgentAuthorityVerification.refuse("authority expires before it was sealed");
     Instant now = opts.asOf() == null ? Instant.now() : opts.asOf(); long skew = opts.clockSkewSeconds() == null ? Div.DEFAULT_CLOCK_SKEW_SECONDS : opts.clockSkewSeconds();
     if (sealed.isAfter(now.plusSeconds(skew))) return AgentAuthorityVerification.refuse("authority is sealed in the future (DIV §5b.2)");
@@ -239,6 +248,8 @@ public final class Verify {
     catch (Exception e) { return AgentAuthorityVerification.refuse("authority payload is missing the signed approval requirement"); }
     if (requirement == null || requirement.requiredApprovals() < 1) return AgentAuthorityVerification.refuse(INVALID_QUORUM_REASON);
     String classProblem = checkSignerClass(requirement); if (classProblem != null) return AgentAuthorityVerification.refuse(classProblem);
+    String floorProblem = expected == null ? null : RequirementFloor.problem(requirement, expected.requirement());
+    if (floorProblem != null) return AgentAuthorityVerification.refuse(floorProblem);
     if (expected == null || isEmpty(expected.target()) || isEmpty(expected.agentDid()) || expected.approvers() == null)
       return AgentAuthorityVerification.refuse("expected target, agentDid and approvers are required");
     String rebuilt = canonicalAgentAuthorityPayload(expected.target(), patterns, receipt.actionDescription(), expected.agentDid(), receipt.requester(), requirement, nonce, sealedAt, expiresAt, parentReceiptHash);
@@ -246,23 +257,53 @@ public final class Verify {
     if ("AUTO_APPROVED".equals(receipt.sigAlg())) return AgentAuthorityVerification.refuse("an agent authority cannot be auto-approved");
     List<ApprovalWitness> ws = witnessesOf(receipt); if (ws.isEmpty()) return AgentAuthorityVerification.refuse("authority missing signature material");
     if (ws.size() > Div.MAX_WITNESSES) return AgentAuthorityVerification.refuse("authority carries too many witnesses");
+    if (requirement.requiredApprovals() > 1 && expected.approvers().isKeySetMode())
+      return AgentAuthorityVerification.refuse("multi-approver quorum requires a DID-mode trust anchor (DIV §5 step 3b)");
     if (requirement.requesterCannotApprove() && expected.approvers().isKeySetMode())
       return AgentAuthorityVerification.refuse("requesterCannotApprove requires a DID-mode trust anchor");
-    Set<String> verified = new LinkedHashSet<>(); List<String> failures = new ArrayList<>();
+    Set<String> verified = new LinkedHashSet<>(); Map<String, String> countedKeys = new LinkedHashMap<>(); List<String> failures = new ArrayList<>();
     for (ApprovalWitness w : ws) {
       ApproverTrustAnchor.Candidates cs = expected.approvers().candidatesRestricted(w.signerDid(), w.signerPublicKey(), null);
       if (cs.error() != null) { failures.add(cs.error()); continue; }
-      String matched = null; String last = "signature does not verify against any trusted approver key";
-      for (ApproverTrustAnchor.Candidate c : cs.list()) { last = verifyWitness(w, c.key(), receipt, opts); if (last.isEmpty()) { matched = c.identity(); break; } }
+      String matched = null; String matchedKey = null; String last = "signature does not verify against any trusted approver key";
+      for (ApproverTrustAnchor.Candidate c : cs.list()) { last = verifyWitness(w, c.key(), receipt, opts); if (last.isEmpty()) { matched = c.identity(); matchedKey = c.key(); break; } }
       if (matched == null) { failures.add(last); continue; }
-      if (requirement.requireHardwareKey() && !"WEBAUTHN".equals(w.sigAlg())) { failures.add("hardware-backed WebAuthn credential required"); continue; }
+      if (requirement.requiresHardwareCredential() && !"WEBAUTHN".equals(w.sigAlg())) { failures.add("hardware-backed WebAuthn credential required"); continue; }
+      if (requirement.requireHardwareKey()) { String synced = WebAuthnSupport.backupFlagsProblem(w); if (synced != null) { failures.add(synced); continue; } }
       if (requirement.requesterCannotApprove() && Objects.equals(w.signerDid(), receipt.requester().did())) { failures.add("four-eyes: requester cannot seal their own authority"); continue; }
+      String shared = sharedKeyProblem(countedKeys, matchedKey, matched);
+      if (shared != null) { failures.add(shared); continue; }
       verified.add(matched);
     }
     if (verified.size() < requirement.requiredApprovals()) return AgentAuthorityVerification.refuse("authority quorum not met: " + verified.size() + " of " + requirement.requiredApprovals() + foldFailures(failures));
     List<String> signers = new ArrayList<>(verified); Collections.sort(signers);
     List<String> scope = new ArrayList<>(new LinkedHashSet<>(patterns)); Collections.sort(scope);
     return new AgentAuthorityVerification(true, null, new VerifiedAgentAuthority(expected.agentDid(), expected.target(), scope, nonce, signers, sealedAt, expiresAt, parentReceiptHash));
+  }
+
+  /**
+   * One key, one person (DIV §4.4.6). An identity-associating anchor that maps the SAME key to two
+   * DIDs would otherwise let that key's holder count as two approvers, since quorum counts distinct
+   * identities. A key already counted for one identity cannot count for another. Keys compare by
+   * decoded bytes (padding and base64/base64url spellings of one encoding match; the same key in
+   * another encoding, COSE vs SPKI, is not detected). Records the key when it is free.
+   */
+  static String sharedKeyProblem(Map<String, String> counted, String key, String identity) {
+    String fingerprint = key;
+    try {
+      String std = key.replace('-', '+').replace('_', '/').replace("=", "");
+      fingerprint = java.util.HexFormat.of().formatHex(Base64.getDecoder().decode(
+          std + "===".substring(0, (4 - std.length() % 4) % 4)));
+    } catch (IllegalArgumentException e) {
+      // not base64: compare the text itself
+    }
+    String owner = counted.get(fingerprint);
+    if (owner != null && !owner.equals(identity)) {
+      return "signer " + identity + " verified under a key already counted for " + owner
+          + "; two approver identities sharing one key count once (DIV §4.4.6)";
+    }
+    counted.put(fingerprint, identity);
+    return null;
   }
 
   /** Just enough of the DIV Intent Payload to gate version/type and read nonce/expiry back. */
@@ -375,8 +416,10 @@ public final class Verify {
               + " never from the receipt (DIV Invariant 3)");
     }
 
-    // The requirement is part of the SIGNED bytes, so reading it back from the payload is not
-    // circular: a forged value changes the string and fails the byte comparison below.
+    // The requirement is part of the SIGNED bytes, so a third party cannot alter it: a forged value
+    // changes the string and fails the byte comparison below. It does NOT bind the signers
+    // themselves — they authored it — which is why step 3d compares it against
+    // expected.requirement().
     if (fields.requirement() == null) {
       return VerifyResult.refuse("receipt payload is missing the signed approval requirement");
     }
@@ -387,6 +430,10 @@ public final class Verify {
     String classProblem = checkSignerClass(fields.requirement());
     if (classProblem != null) {
       return VerifyResult.refuse(classProblem);
+    }
+    String floorProblem = RequirementFloor.problem(fields.requirement(), expected.requirement());
+    if (floorProblem != null) {
+      return VerifyResult.refuse(floorProblem);
     }
     // DIV §5-step-3c. Before Local Payload Reconstruction, so an unsupported payload shape does not
     // surface as a params mismatch.
@@ -406,13 +453,13 @@ public final class Verify {
       }
       OffsetDateTime challenged;
       try {
-        challenged = OffsetDateTime.parse(fields.challengedAt());
+        challenged = SignedTime.parse(fields.challengedAt());
       } catch (DateTimeParseException e) {
         return VerifyResult.refuse("challengedAt is not a valid RFC3339 timestamp");
       }
       OffsetDateTime expiry;
       try {
-        expiry = OffsetDateTime.parse(expiresAt);
+        expiry = SignedTime.parse(expiresAt);
       } catch (DateTimeParseException e) {
         return VerifyResult.refuse("expiresAt is not a valid RFC3339 timestamp");
       }
@@ -435,8 +482,9 @@ public final class Verify {
       }
       // A hardware-key policy CANNOT be satisfied offline (DIV §5a.3 step 4): WebAuthn needs a
       // secure context and an RP ID an offline signing surface will not match, so an offline
-      // witness is always a bare key. Fail closed, and say why.
-      if (fields.requirement().requireHardwareKey()) {
+      // witness is always a bare key. Fail closed, and say why. A non-empty model allowlist is the
+      // same policy class: a bare key has no authenticator model at all.
+      if (fields.requirement().requiresHardwareCredential()) {
         return VerifyResult.refuse(
             "the signed policy requires a hardware-backed WebAuthn credential, which cannot be"
                 + " produced offline — this action cannot be approved out of band (DIV §5a.3)");
@@ -451,7 +499,7 @@ public final class Verify {
       VerifiedDelegation d = opts.delegation();
       OffsetDateTime delegationExpiry;
       try {
-        delegationExpiry = OffsetDateTime.parse(d.expiresAt());
+        delegationExpiry = SignedTime.parse(d.expiresAt());
       } catch (DateTimeParseException | NullPointerException e) {
         return VerifyResult.refuse("delegation expiresAt is not a valid RFC3339 timestamp");
       }
@@ -532,7 +580,7 @@ public final class Verify {
     if (!opts.allowExpired()) {
       OffsetDateTime expiry;
       try {
-        expiry = OffsetDateTime.parse(expiresAt);
+        expiry = SignedTime.parse(expiresAt);
       } catch (DateTimeParseException e) {
         return VerifyResult.refuse("expiresAt is not a valid RFC3339 timestamp");
       }
@@ -572,12 +620,14 @@ public final class Verify {
           witnesses.size(), Div.MAX_WITNESSES));
     }
 
+    if (fields.requirement().requiredApprovals() > 1 && expected.approvers().isKeySetMode())
+      return VerifyResult.refuse("multi-approver quorum requires a DID-mode trust anchor (DIV §5 step 3b)");
     if (fields.requirement().requesterCannotApprove() && expected.approvers().isKeySetMode())
       return VerifyResult.refuse("requesterCannotApprove requires a DID-mode trust anchor");
     // Count DISTINCT approvers whose signature verifies under a key we independently trust.
     // Distinct is load-bearing: without it, N copies of one approver's signature satisfy an N-of-M
     // quorum.
-    Set<String> verified = new LinkedHashSet<>();
+    Set<String> verified = new LinkedHashSet<>(); Map<String, String> countedKeys = new LinkedHashMap<>();
     List<String> failures = new ArrayList<>();
     for (ApprovalWitness w : witnesses) {
       ApproverTrustAnchor.Candidates cands =
@@ -586,12 +636,12 @@ public final class Verify {
         failures.add(cands.error());
         continue;
       }
-      String matched = null;
+      String matched = null; String matchedKey = null;
       String last = "signature does not verify against any trusted approver key";
       for (ApproverTrustAnchor.Candidate c : cands.list()) {
         String why = verifyWitness(w, c.key(), receipt, opts);
         if (why.isEmpty()) {
-          matched = c.identity();
+          matched = c.identity(); matchedKey = c.key();
           break;
         }
         last = why;
@@ -603,10 +653,17 @@ public final class Verify {
       // A hardware-key policy is only partially checkable offline: a bare P-256 key carries no
       // attestation at all, so it can never satisfy the requirement, while a WebAuthn assertion is
       // accepted without proving the authenticator's model.
-      if (fields.requirement().requireHardwareKey() && !"WEBAUTHN".equals(w.sigAlg())) {
+      if (fields.requirement().requiresHardwareCredential() && !"WEBAUTHN".equals(w.sigAlg())) {
         failures.add("signer " + w.signerDid()
             + " used a bare key, but the signed policy requires a hardware-backed WebAuthn credential");
         continue;
+      }
+      if (fields.requirement().requireHardwareKey()) {
+        String synced = WebAuthnSupport.backupFlagsProblem(w);
+        if (synced != null) {
+          failures.add(synced);
+          continue;
+        }
       }
       // Four-eyes, verified offline against the requester in the same signed payload.
       if (fields.requirement().requesterCannotApprove()
@@ -614,6 +671,8 @@ public final class Verify {
         failures.add("four-eyes: requester " + w.signerDid() + " cannot approve their own action");
         continue;
       }
+      String shared = sharedKeyProblem(countedKeys, matchedKey, matched);
+      if (shared != null) { failures.add(shared); continue; }
       verified.add(matched);
     }
 
@@ -702,13 +761,13 @@ public final class Verify {
     }
     OffsetDateTime sealed;
     try {
-      sealed = OffsetDateTime.parse(fields.sealedAt());
+      sealed = SignedTime.parse(fields.sealedAt());
     } catch (DateTimeParseException e) {
       return refuseDelegation("sealedAt is not a valid RFC3339 timestamp");
     }
     OffsetDateTime expiry;
     try {
-      expiry = OffsetDateTime.parse(fields.expiresAt());
+      expiry = SignedTime.parse(fields.expiresAt());
     } catch (DateTimeParseException e) {
       return refuseDelegation("expiresAt is not a valid RFC3339 timestamp");
     }
@@ -740,6 +799,10 @@ public final class Verify {
     String classProblem = checkSignerClass(fields.requirement());
     if (classProblem != null) {
       return refuseDelegation(classProblem);
+    }
+    String floorProblem = RequirementFloor.problem(fields.requirement(), expected.requirement());
+    if (floorProblem != null) {
+      return refuseDelegation(floorProblem);
     }
     if (isEmpty(expected.target())) {
       return refuseDelegation(
@@ -790,7 +853,7 @@ public final class Verify {
           "delegation carries %d witnesses, above the %d this verifier will process",
           witnesses.size(), Div.MAX_WITNESSES));
     }
-    Set<String> verified = new LinkedHashSet<>();
+    Set<String> verified = new LinkedHashSet<>(); Map<String, String> countedKeys = new LinkedHashMap<>();
     List<String> failures = new ArrayList<>();
     for (ApprovalWitness w : witnesses) {
       ApproverTrustAnchor.Candidates cands =
@@ -799,12 +862,12 @@ public final class Verify {
         failures.add(cands.error());
         continue;
       }
-      String matched = null;
+      String matched = null; String matchedKey = null;
       String last = "signature does not verify against any trusted approver key";
       for (ApproverTrustAnchor.Candidate c : cands.list()) {
         String why = verifyWitness(w, c.key(), receipt, opts);
         if (why.isEmpty()) {
-          matched = c.identity();
+          matched = c.identity(); matchedKey = c.key();
           break;
         }
         last = why;
@@ -813,16 +876,25 @@ public final class Verify {
         failures.add(last);
         continue;
       }
-      if (fields.requirement().requireHardwareKey() && !"WEBAUTHN".equals(w.sigAlg())) {
+      if (fields.requirement().requiresHardwareCredential() && !"WEBAUTHN".equals(w.sigAlg())) {
         failures.add("signer " + w.signerDid()
             + " used a bare key, but the signed policy requires a hardware-backed WebAuthn credential");
         continue;
+      }
+      if (fields.requirement().requireHardwareKey()) {
+        String synced = WebAuthnSupport.backupFlagsProblem(w);
+        if (synced != null) {
+          failures.add(synced);
+          continue;
+        }
       }
       if (fields.requirement().requesterCannotApprove()
           && Objects.equals(w.signerDid(), receipt.requester().did())) {
         failures.add("four-eyes: requester " + w.signerDid() + " cannot delegate to themselves");
         continue;
       }
+      String shared = sharedKeyProblem(countedKeys, matchedKey, matched);
+      if (shared != null) { failures.add(shared); continue; }
       verified.add(matched);
     }
     int required = fields.requirement().requiredApprovals();
@@ -972,7 +1044,8 @@ public final class Verify {
     if ("WEBAUTHN".equals(w.sigAlg())) {
       return WebAuthnSupport.verifyWitness(w, trustedKey, receipt, opts);
     }
-    if (!"ES256".equals(w.sigAlg())) return "unsupported witness signature algorithm";
+    // DIV §4.4.2: absent/unknown labels fall back to ES256; policy receipts never do.
+    if ("AUTO_APPROVED".equals(w.sigAlg())) return "unsupported witness signature algorithm";
     // ES256: the human's key signed the canonical payload bytes directly.
     byte[] pubKeyBytes;
     try {

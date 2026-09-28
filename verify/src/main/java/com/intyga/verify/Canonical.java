@@ -120,7 +120,7 @@ public final class Canonical {
    * escape only {@code "} and {@code \} plus the C0 control range, and emit everything else
    * literally — including {@code <}, {@code >}, {@code &} and U+2028/U+2029, which several JSON
    * libraries escape and JS does not. Iterating UTF-16 code units and appending them unchanged
-   * preserves surrogate pairs byte-for-byte.
+   * preserves surrogate pairs byte-for-byte; an unpaired surrogate is refused.
    */
   static String jsMarshalString(String s) {
     StringBuilder b = new StringBuilder(s.length() + 2);
@@ -136,7 +136,11 @@ public final class Canonical {
         case '\r' -> b.append("\\r");
         case '\t' -> b.append("\\t");
         default -> {
-          if (c < 0x20 || isLoneSurrogate(s, i)) {
+          if (isLoneSurrogate(s, i)) {
+            throw new NonPortableValueException(
+                "a string contains an unpaired UTF-16 surrogate, which is not I-JSON (RFC 8785 / DIV §4.1)");
+          }
+          if (c < 0x20) {
             b.append(String.format("\\u%04x", (int) c));
           } else {
             b.append(c);
@@ -151,12 +155,11 @@ public final class Canonical {
    * Whether the code unit at {@code i} is a surrogate with no partner — a high surrogate not
    * followed by a low one, or a low surrogate not preceded by a high one.
    *
-   * <p>Such a code unit is not valid UTF-8 and every language disposes of it differently: the TS
-   * reference escapes it (ES2019 well-formed {@code JSON.stringify}), Go's decoder substitutes
-   * U+FFFD, and serde_json rejects it at parse. Appending it raw here would be a FOURTH answer —
-   * {@code String.getBytes(UTF_8)} maps it to {@code '?'} — so the same receipt would canonicalize
-   * differently in Java than anywhere else and read as tampering. Matching the TS reference is
-   * correct because TS is the normative source of the canonical form.
+   * <p>Such a code unit is not valid Unicode, and RFC 8785 builds on I-JSON (RFC 7493 §2.1), which
+   * forbids it. Every language used to dispose of it differently — the TS reference escaped it,
+   * Go's decoder substitutes U+FFFD, serde_json rejects it at parse, and {@code getBytes(UTF_8)}
+   * maps it to {@code '?'} — so a receipt carrying one verified in some ports only. Every port now
+   * REFUSES it (DIV §4.1), which changes no canonical bytes for valid text.
    */
   private static boolean isLoneSurrogate(String s, int i) {
     char c = s.charAt(i);

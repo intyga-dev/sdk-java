@@ -23,6 +23,31 @@ final class WebAuthnSupport {
   // WebAuthn authenticatorData flag bits (WebAuthn L3 §6.1).
   private static final int FLAG_UP = 0x01; // User Present
   private static final int FLAG_UV = 0x04; // User Verified
+  private static final int FLAG_BE = 0x08; // Backup Eligible — the credential may be synced
+  private static final int FLAG_BS = 0x10; // Backup State — the credential is currently backed up
+
+  /**
+   * Under a signed requireHardwareKey, a WEBAUTHN witness whose authenticatorData carries the Backup
+   * Eligible or Backup State flag cannot count (DIV §4.4.5 rule 6). The flags are covered by the
+   * assertion signature, so a relying party can catch an issuer that let a synced passkey sign a
+   * hardware-pinned action. BE=0 is the authenticator's own claim, not attestation. Called only for
+   * a witness that already verified, so authenticatorData decodes to at least 37 bytes.
+   *
+   * @return the refusal reason, or null when the flags say device-bound (or the witness is not WebAuthn)
+   */
+  static String backupFlagsProblem(ApprovalWitness w) {
+    if (!"WEBAUTHN".equals(w.sigAlg()) || w.authenticatorData() == null) return null;
+    byte[] authData;
+    try {
+      authData = decodeBase64Flexible(w.authenticatorData());
+    } catch (IllegalArgumentException e) {
+      return "authenticatorData is unreadable";
+    }
+    if (authData.length < 37) return "authenticatorData is unreadable";
+    if ((authData[32] & (FLAG_BE | FLAG_BS)) == 0) return null;
+    return "signer " + w.signerDid() + " used a backup-eligible (synced) passkey — authenticatorData"
+        + " BE/BS flag set — but the signed policy requires a hardware-backed WebAuthn credential";
+  }
 
   private static final class CborReader {
     private final byte[] buf;
@@ -174,7 +199,9 @@ final class WebAuthnSupport {
       // crossOrigin is the only signal that separates "approved on our page" from "approved inside
       // someone else's page": an embedded RP frame reports the RP's OWN origin and its rpIdHash
       // matches too (W3C WebAuthn L3 §7.2 step 9).
-      @JsonProperty("crossOrigin") boolean crossOrigin) {}
+      @JsonProperty("crossOrigin") boolean crossOrigin,
+      // WebAuthn L3: the top-level page when the ceremony ran in a frame.
+      @JsonProperty("topOrigin") String topOrigin) {}
 
   /**
    * Verifies one WEBAUTHN witness against an already-TRUSTED key (from the caller's trust anchor,
@@ -215,6 +242,12 @@ final class WebAuthnSupport {
     }
     if (clientData.crossOrigin() && !opts.allowCrossOrigin()) {
       return "assertion was produced in a cross-origin frame (crossOrigin=true)";
+    }
+    // A topOrigin that differs from origin is the same embedding reported another way, refused
+    // exactly like crossOrigin=true (DIV §4.4.5 rule 5) — the gateway refuses it at ingest.
+    if (clientData.topOrigin() != null && !clientData.topOrigin().equals(clientData.origin())
+        && !opts.allowCrossOrigin()) {
+      return "assertion was produced in a frame embedded by another origin (topOrigin differs from origin)";
     }
     String expectedChallenge =
         Base64.getUrlEncoder()

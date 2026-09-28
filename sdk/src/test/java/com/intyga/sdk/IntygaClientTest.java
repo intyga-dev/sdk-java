@@ -82,6 +82,85 @@ class IntygaClientTest {
         .build();
   }
 
+  // I11: a plain-http gateway would carry the bearer token or client secret in the clear, so build()
+  // refuses it before any request exists. Loopback stays usable for a local gateway.
+  @Test
+  void refusesNonHttpsGatewayAtConstruction() {
+    for (String bad :
+        List.of(
+            "http://gw.example",
+            "http://10.0.0.5:8787",
+            "http://128.0.0.1",
+            "http://localhost.evil.example",
+            "http://127.0.0.1.nip.io",
+            "http://[::2]",
+            "http://localhost@gw.example",
+            "ftp://gw.example",
+            "gw.example")) {
+      IllegalArgumentException e =
+          assertThrows(
+              IllegalArgumentException.class,
+              () -> IntygaClient.builder().gatewayUrl(bad).token("t").build(),
+              bad);
+      assertTrue(
+          e.getMessage().contains("https://") || e.getMessage().contains("not a valid"),
+          e.getMessage());
+    }
+    assertTrue(
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> IntygaClient.builder().gatewayUrl("http://gw.example").build())
+            .getMessage()
+            .contains("must use https://"));
+    for (String ok :
+        List.of(
+            "https://gw.example",
+            "HTTPS://gw.example/",
+            "http://localhost:8787",
+            "http://LOCALHOST",
+            "http://127.0.0.1:8787",
+            "http://127.200.3.4",
+            "http://[::1]:8787")) {
+      assertNotNull(IntygaClient.builder().gatewayUrl(ok).token("t").build(), ok);
+    }
+  }
+
+  @Test
+  void lateApprovalIsExpired() {
+    server.createContext("/authorize", e -> respond(e, 200, "{\"nonce\":\"late\",\"status\":\"PENDING\"}"));
+    server.createContext("/authorize/late", e -> {
+      try { Thread.sleep(100); } catch (InterruptedException ex) { Thread.currentThread().interrupt(); }
+      respond(e, 200, "{\"status\":\"APPROVED\"}");
+    });
+    var client = IntygaClient.builder().gatewayUrl(baseUrl()).token("t").build();
+    var result = client.requireApproval("wire", RequireApprovalOptions.builder()
+        .authorize(wipeOptions()).timeout(Duration.ofMillis(50)).interval(Duration.ofMillis(1)).build());
+    assertEquals(ApprovalStatus.EXPIRED, result.status());
+    assertEquals("late", result.nonce());
+  }
+
+  @Test
+  void publicLookupDoesNotExchangeOrSendCredentials() {
+    server.createContext("/verify/hash", e -> {
+      expect(e.getRequestHeaders().getFirst("Authorization") == null, "public lookup sent credentials");
+      respond(e, 200, "{\"verified\":true,\"status\":\"SIGNED\",\"documentHash\":\"hash\"}");
+    });
+    assertTrue(IntygaClient.builder().gatewayUrl(baseUrl()).build().verify("hash").verified());
+    assertNoViolations();
+  }
+
+  @Test
+  void preservesIssuedAgentContextAcrossPolling() {
+    server.createContext("/authorize", e -> respond(e, 200,
+        "{\"nonce\":\"ctx\",\"status\":\"PENDING\",\"agentContext\":{\"nbf\":\"issued\"}}"));
+    server.createContext("/authorize/ctx", e -> respond(e, 200,
+        "{\"status\":\"APPROVED\",\"agentContext\":{\"nbf\":\"wrong\"}}"));
+    var client = IntygaClient.builder().gatewayUrl(baseUrl()).token("t").build();
+    var result = client.requireApproval("wire", RequireApprovalOptions.builder()
+        .authorize(wipeOptions()).build());
+    assertEquals("issued", result.agentContext().path("nbf").asText());
+  }
+
   @Test
   void requireApprovalHappyPath() {
     AtomicInteger polls = new AtomicInteger();

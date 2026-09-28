@@ -22,6 +22,17 @@ public final class Rekor {
   }
 
   public static Verification verifyAnchor(Ledger.SignedAnchor anchor, String rekorPublicKey) {
+    return verifyAnchor(anchor, rekorPublicKey, null);
+  }
+
+  /**
+   * As {@link #verifyAnchor(Ledger.SignedAnchor, String)}, and when {@code submitterKeys} is non-empty
+   * the hashedrekord must have been submitted under one of those producer keys with a valid ES256
+   * signature over the anchor digest. Rekor logs a submission under ANY key, so without this anyone
+   * who can compute the digest (built from public fields) can have it logged.
+   */
+  public static Verification verifyAnchor(Ledger.SignedAnchor anchor, String rekorPublicKey,
+      java.util.List<String> submitterKeys) {
     if (anchor.evidence() == null) return Verification.refuse("rekor anchor carries no evidence");
     JsonNode e;
     try { e = Records.JSON.readTree(Base64.getDecoder().decode(anchor.evidence())); }
@@ -37,6 +48,8 @@ public final class Rekor {
         return Verification.refuse("rekor entry body is not a readable hashedrekord");
       String logged = b.path("spec").path("data").path("hash").path("value").asText().toLowerCase();
       if (!logged.equals(payloadHashFor(anchor))) return Verification.refuse("rekor entry attests a different payload");
+      if (submitterKeys != null && !submitterKeys.isEmpty() && !submittedByPinnedKey(b, anchor, submitterKeys))
+        return Verification.refuse("rekor entry was not submitted under a pinned producer key with a valid signature over this anchor");
       PublicKey key = Ledger.parseAnchorPublicKey(rekorPublicKey, "ES256");
       if (key == null) return Verification.refuse("rekor public key is not an EC P-256 key");
       Map<String,Object> payload = new LinkedHashMap<>(); payload.put("body", body);
@@ -47,6 +60,25 @@ public final class Rekor {
       if (!v.verify(Base64.getDecoder().decode(set))) return Verification.refuse("rekor SET does not verify under the supplied log key");
       return new Verification(true, null, e.path("logIndex").longValue(), e.path("logID").asText(), e.path("integratedTime").longValue());
     } catch (Exception ex) { return Verification.refuse("rekor SET verification failed: " + ex.getMessage()); }
+  }
+
+  /** hashedrekord {@code publicKey.content} is base64 of the PEM text. */
+  private static boolean submittedByPinnedKey(JsonNode body, Ledger.SignedAnchor anchor, java.util.List<String> pinned) {
+    try {
+      JsonNode sig = body.path("spec").path("signature");
+      String pem = new String(Base64.getDecoder().decode(sig.path("publicKey").path("content").asText("")), StandardCharsets.UTF_8);
+      PublicKey submitted = Ledger.parseAnchorPublicKey(pem, "ES256");
+      if (submitted == null) return false;
+      boolean match = false;
+      for (String k : pinned) {
+        PublicKey p = Ledger.parseAnchorPublicKey(k, "ES256");
+        if (p != null && java.util.Arrays.equals(p.getEncoded(), submitted.getEncoded())) { match = true; break; }
+      }
+      if (!match) return false;
+      byte[] digest = java.util.HexFormat.of().parseHex(Ledger.anchorDigestHex(anchor.anchorInput()));
+      return Ecdsa.verifySignature(Ecdsa.parseSpkiP256(submitted.getEncoded()), digest,
+          Base64.getDecoder().decode(sig.path("content").asText("")));
+    } catch (Exception e) { return false; }
   }
 
   private Rekor() {}

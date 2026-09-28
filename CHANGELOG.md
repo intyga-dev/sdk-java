@@ -5,6 +5,18 @@ All notable changes to `com.intyga:intyga-sdk` are documented here. The format f
 
 ## [Unreleased]
 
+- **Security (I11):** `IntygaClient.Builder.build()` throws `IllegalArgumentException` for a
+  `gatewayUrl` that is not `https://`, except `http://` to a loopback host (`localhost`,
+  `127.0.0.0/8`, `::1`) for local development.
+
+- Refuse approvals received after the caller's monotonic wait deadline; include challenge creation
+  in the wait window and cap polling sleeps to its remaining duration.
+
+- Preserve challenge-issued agent context through approval polling for DIV continuity checks.
+- Public witness lookups require no credentials and refuse non-success HTTP responses.
+- Default HTTP transports use finite request timeouts and refuse redirects; caller-supplied
+  transports remain the caller's responsibility.
+
 - Rebuilt against the DIV Intent Payload's new REQUIRED `evidence` field (DIV §4.3.4), which is
   `null` in this version. No API change; receipts carry the field inside `canonicalPayload` only.
 

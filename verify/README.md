@@ -36,7 +36,12 @@ VerifyResult res = Verify.verifyApprovalReceipt(
         "wipe_production",
         Map.of("database", "prod-db-1"),
         ApproverTrustAnchor.ofPublicKeys(List.of(approverSpkiB64))),
-    VerifyOptions.defaults());
+    // REQUIRED for passkey receipts (the normal flow): the approval console's exact origin and RP
+    // ID, from the trust-anchor file exported in the console (its `webauthn` block).
+    VerifyOptions.builder()
+        .expectedOrigin(System.getenv("INTYGA_WEBAUTHN_ORIGIN"))
+        .expectedRpId(System.getenv("INTYGA_WEBAUTHN_RP_ID"))
+        .build());
 if (!res.ok()) {
   throw new IllegalStateException("refusing to proceed: " + res.reason());
 }
@@ -44,7 +49,23 @@ if (!res.ok()) {
 
 A receipt arrives from the client as raw JSON; `ApprovalReceipt.parse(...)` accepts either a `String` or the `JsonNode` that `com.intyga.sdk.ApprovalResult.receipt()` returns.
 
-**One-approver-per-key caveat.** In public-keys mode the identity IS the key, so an M-of-N quorum counts credentials, not people: one approver whose two registered credentials are both listed satisfies a 2-of-N alone. A signed `requesterCannotApprove` rule requires DID/identity trust; key-only anchors are refused because `signerDid` is unverified in that mode. For `requiredApprovals` > 1, use the DID/identity form (`ApproverTrustAnchor.ofDidsMultiKey`), which counts distinct approvers (DIV §4.4.6). Delegation verification goes further and **refuses** a public-keys anchor outright — see below.
+**Quorum trust.** Key-only trust is accepted only for a one-approval requirement without
+`requesterCannotApprove`. Multi-approver quorums and separation of duties require a DID/identity
+anchor and otherwise fail closed (DIV §5 step 3b). Several credentials for one DID count as one
+approver. Delegations require identity trust regardless of quorum size.
+
+**Requirement floor (DIV §5 step 3d).** The signed `requirement` is the signers' own statement: its
+signature stops a third party from altering it, not the approvers it constrains from writing a weaker
+one. One approver who is also the requester can sign a 1-of-1 payload alone. **Without a floor this
+verifier proves only the quorum the signers stated.** When you know the rule, pass
+`expected.withRequirement(new RequirementFloor(3, true, false))` (or the seven-argument `Expected`
+constructor; `AgentAuthorityExpected` takes it as a fourth argument). Null keeps the previous
+behaviour, and the existing constructors are unchanged.
+A signed requirement weaker on any field — fewer approvals, no four-eyes or no hardware key where the
+floor demands one — is refused before any signature is counted, with a reason starting "signed
+requirement is weaker than the relying party's policy"; an equal or stricter one passes. A malformed
+floor (quorum below 1) is refused rather than ignored. The same field exists on the delegation
+expectation (pass the ordinary rule) and the agent-authority expectation (your sealing policy).
 
 One byte of drift — a swapped target, an appended region — and verification fails, because the signature was over the exact bytes you just recomputed.
 
@@ -61,7 +82,7 @@ VerifyOptions opts = VerifyOptions.builder()
     .build();
 ```
 
-`requireUserVerification` defaults to true (demands the User-Verified flag); set it to `false` to accept mere user presence. Policy `AUTO_APPROVED` receipts carry no human signature and fail closed unless you opt in with `allowAutoApproved(true)`.
+`requireUserVerification` defaults to true (demands the User-Verified flag); set it to `false` to accept mere user presence (`verifyPlatformReceipt` ignores it: DIV §5c.3 requires user verification unconditionally). Policy `AUTO_APPROVED` receipts carry no human signature and fail closed unless you opt in with `allowAutoApproved(true)`.
 
 ## Offline approvals and delegations
 
@@ -91,10 +112,34 @@ Additional receipt APIs and remaining limits:
 One further precision about the portable-number rule (DEWP §4.3.1). This port refuses a non-portable number rather than best-effort serializing it, like `verify-go` — with a single exception it is not able to see: Jackson normalizes an integer-form `-0` to `0` while parsing, so the sign is gone before the check runs and that one value is serialized as `0`. The float form `-0.0` is refused correctly. No conformant producer emits either (JavaScript's `JSON.stringify(-0)` is already `"0"`, and the reference producer refuses at ingestion), so this is reachable only from a hand-authored or foreign document. The spec permits both responses, so the behaviour is conformant either way; it is stated here because "refuses" would otherwise be very slightly overclaiming.
 
 Use `Dewp.verifyBundle` for one proof and `Dewp.verifyEvidenceBundle` for a multi-entry audit export.
-Both require caller-supplied roots for a trustworthy verdict; quorum keys likewise come from the
+Anchors sign the root, timestamp, issuer, algorithm, sequence range and checkpoint chain hash;
+anchors missing the position fields are refused. Evidence bundles compare those fields against
+their checkpoint and recompute its chain hash. For direct `Ledger.verifyAnchorQuorum` calls,
+pass an `ExpectedCheckpoint` containing every checkpoint field you know.
+
+`AnchorPolicy.maxAnchorLagSeconds` defaults to 86400 seconds. Rekor's authenticated
+`integratedTime` and the TSA's `genTime` must fall between 300 seconds before the checkpoint's
+claimed time and that lag limit after it. `witnessTimes` on quorum results, proof-bundle results
+and evidence-bundle roots reports the earliest authenticated time per issuer, including evidence
+rejected for excessive lag. SELF anchors supply no independent witness time. To restrict who
+submitted a Rekor entry, configure `rekorSubmitterKeys` with the producer's PEM or base64 SPKI
+public keys; without those pins the log proves inclusion and time, not producer identity.
+
+A supplied root is labelled `rootSource: "caller-supplied"`; the verifier cannot determine whether
+the caller obtained it independently. Both bundle APIs require caller-supplied roots for a
+trustworthy verdict; quorum keys likewise come from the
 caller's policy, never the bundle. Bundle-carried anchors cannot establish divergence; use the
-checkpoint-keyed caller anchor map for that. RFC 3161/CMS and WEBHOOK evidence do not count toward
-quorum. Authority verification checks the seal but cannot discover later online revocation.
+checkpoint-keyed caller anchor map for that. RFC 3161 anchors count when caller-owned
+`Rfc3161.Trust` is supplied by issuer. The optional adapter invokes an installed OpenSSL 3 binary
+without network access, pins the CA and signer certificate digest, and requires an explicit
+`crl` (with offline CRL) or `unchecked` revocation choice. A caller-selected evaluation time is
+supported; the default rounds now up by at most one second for fresh fractional timestamps.
+Historical verification checks certificate validity at issuance but cannot reconstruct historical
+revocation state. WEBHOOK evidence does not count toward
+quorum. For a multi-issuer policy, pass `rekorIssuer` with the Rekor public key; an unscoped legacy
+key is accepted only when exactly one issuer is trusted, so producer-selected labels cannot turn one
+log into multiple quorum witnesses. Authority verification checks the seal but cannot discover
+later online revocation.
 
 ## Also available in
 - TypeScript — [`@intyga/verify`](https://github.com/intyga-dev/verify)

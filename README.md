@@ -65,7 +65,12 @@ VerifyResult check = Verify.verifyApprovalReceipt(
     ApprovalReceipt.parse(r.receipt()),
     new Expected("prod-db-cluster-01", r.nonce(), "wipe_production", params,
         ApproverTrustAnchor.ofPublicKeys(trustedApproverKeys())),
-    VerifyOptions.defaults());
+    // REQUIRED for passkey receipts (the normal flow): the approval console's exact origin and RP
+    // ID, from the trust-anchor file exported in the console (its `webauthn` block).
+    VerifyOptions.builder()
+        .expectedOrigin(System.getenv("INTYGA_WEBAUTHN_ORIGIN"))
+        .expectedRpId(System.getenv("INTYGA_WEBAUTHN_RP_ID"))
+        .build());
 if (!check.ok()) {
   throw new IllegalStateException("refusing to proceed: " + check.reason());
 }
@@ -91,7 +96,7 @@ For framework code (a Spring/Quarkus handler, a LangChain4j tool method), `requi
 
 ## API
 
-- `IntygaClient.builder()` — `gatewayUrl` + either a pre-minted `token` or `clientId`/`clientSecret`; `build()` performs no I/O. An exchanged token is re-exchanged automatically shortly before the `expires_in` the gateway reports (and once more on a 401), so a long-lived client never has to manage tokens; a pre-minted `token` is used as given and never refreshed.
+- `IntygaClient.builder()` — `gatewayUrl` + either a pre-minted `token` or `clientId`/`clientSecret`; `build()` performs no I/O, and throws `IllegalArgumentException` unless `gatewayUrl` is `https://` (plain `http://` is accepted only for a loopback host — `localhost`, `127.0.0.0/8`, `::1` — for local development). An exchanged token is re-exchanged automatically shortly before the `expires_in` the gateway reports (and once more on a 401), so a long-lived client never has to manage tokens; a pre-minted `token` is used as given and never refreshed.
 - `requireApproval(description, options)` — create a challenge and block until resolved (default 120s wait, 2s poll).
 - `requireApprovalOrThrow(description, options)` — same, but non-APPROVED throws `ApprovalRefusedException`.
 - `authorize` / `status` / `consume` — the individual steps (create, poll, execution-time re-bind). `authorize` requires a `target`; `consume` takes `(nonce, target, actionType, params)` and must be given the same target the approval was bound to.

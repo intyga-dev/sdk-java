@@ -16,9 +16,17 @@ import com.fasterxml.jackson.databind.JsonNode;
  *     for their own single-use check; null on a bare {@link IntygaClient#status} call.
  */
 public record ApprovalResult(
-    ApprovalStatus status, String signatureHash, JsonNode receipt, String nonce) {
+    ApprovalStatus status, String signatureHash, JsonNode receipt, String nonce, JsonNode agentContext) {
+
+  public ApprovalResult(ApprovalStatus status, String signatureHash, JsonNode receipt, String nonce) {
+    this(status, signatureHash, receipt, nonce, null);
+  }
+
+  ApprovalResult withChallenge(String nonce, JsonNode context) {
+    return new ApprovalResult(status, signatureHash, receipt, nonce, context);
+  }
 
   ApprovalResult withNonce(String nonce) {
-    return new ApprovalResult(status, signatureHash, receipt, nonce);
+    return new ApprovalResult(status, signatureHash, receipt, nonce, agentContext);
   }
 }

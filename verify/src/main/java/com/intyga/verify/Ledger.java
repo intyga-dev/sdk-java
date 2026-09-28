@@ -14,6 +14,7 @@ import java.util.Base64;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Set;
+import java.util.Map;
 import java.util.LinkedHashSet;
 import java.util.function.Function;
 
@@ -279,15 +280,55 @@ public final class Ledger {
         new ProofBounds(proof.checkpointLeafIndex(), proof.checkpointLeafCount()));
   }
 
-  /** The signable part of an anchor (DEWP §5.2). */
-  public record AnchorInput(String dailyRoot, String timestamp, String issuer, String algorithm) {}
+  /**
+   * The signable part of an anchor (DEWP §5.2): the root, the checkpoint's claimed time, the issuer
+   * and algorithm, and the checkpoint's POSITION — its global seq range and §5.4 chain hash. The
+   * position is what makes an external witness evidence about one checkpoint rather than about a
+   * root string that could be recomputed and witnessed at any later time.
+   */
+  public record AnchorInput(String dailyRoot, String timestamp, String issuer, String algorithm,
+      String seqStart, String seqEnd, String chainHash) {}
 
-  /** JCS of [dailyRoot, timestamp, issuer, algorithm]. */
+  /** JCS of [dailyRoot, timestamp, issuer, algorithm, seqStart, seqEnd, chainHash]. */
   public static String anchorPreimage(AnchorInput a) {
     // `issuer` is a URL and can carry a query string, so it needs JS-compatible string escaping
-    // too. All four elements are strings, so the non-portable-number refusal is unreachable here.
+    // too. All seven elements are strings, so the non-portable-number refusal is unreachable here.
     return Canonical.stableStringify(
-        Arrays.asList(nz(a.dailyRoot()), nz(a.timestamp()), nz(a.issuer()), nz(a.algorithm())));
+        Arrays.asList(nz(a.dailyRoot()), nz(a.timestamp()), nz(a.issuer()), nz(a.algorithm()),
+            nz(a.seqStart()), nz(a.seqEnd()), nz(a.chainHash())));
+  }
+
+  private static final java.time.format.DateTimeFormatter DEWP_TIMESTAMP =
+      java.time.format.DateTimeFormatter.ofPattern("uuuu-MM-dd'T'HH:mm:ss.SSS'Z'")
+          .withZone(java.time.ZoneOffset.UTC)
+          .withResolverStyle(java.time.format.ResolverStyle.STRICT);
+
+  /**
+   * Milliseconds since the epoch for an exact DEWP §4.3 timestamp (YYYY-MM-DDTHH:mm:ss.sssZ), or null.
+   * Strict (and round-tripped) so every port reads the same instant from the same bytes.
+   */
+  public static Long parseAnchorTimestampMs(String ts) {
+    if (ts == null || !ts.matches("[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z")) return null;
+    try {
+      java.time.Instant instant = java.time.Instant.from(DEWP_TIMESTAMP.parse(ts));
+      return DEWP_TIMESTAMP.format(instant).equals(ts) ? instant.toEpochMilli() : null;
+    } catch (RuntimeException e) {
+      return null;
+    }
+  }
+
+  /**
+   * All seven signed fields have the shapes DEWP §5.2 requires. A missing position field is refused
+   * rather than hashed: the preimage would not be one any conformant producer signed.
+   */
+  public static boolean isWellFormedAnchor(AnchorInput a) {
+    // §5.2 algorithm registry: the label is signed, so any other one is not a §5.2 anchor at all.
+    return a != null && a.dailyRoot() != null && a.dailyRoot().matches("[0-9a-f]{64}")
+        && parseAnchorTimestampMs(a.timestamp()) != null && a.issuer() != null
+        && ("ES256".equals(a.algorithm()) || "Ed25519".equals(a.algorithm()) || "RSA-PSS".equals(a.algorithm()))
+        && a.seqStart() != null && a.seqStart().matches("[0-9]{1,20}")
+        && a.seqEnd() != null && a.seqEnd().matches("[0-9]{1,20}")
+        && a.chainHash() != null && a.chainHash().matches("[0-9a-f]{64}");
   }
 
   /**
@@ -316,26 +357,73 @@ public final class Ledger {
       String keyId,
       String signature,
       String kind,
-      String evidence) {
+      String evidence,
+      String seqStart,
+      String seqEnd,
+      String chainHash) {
 
-    /** Source-compatible Core constructor retained for sdk-java and existing consumers. */
+    /** Without the position fields: such an anchor is not well-formed and never verifies. */
+    public SignedAnchor(String dailyRoot, String timestamp, String issuer, String algorithm,
+        String keyId, String signature, String kind, String evidence) {
+      this(dailyRoot, timestamp, issuer, algorithm, keyId, signature, kind, evidence, null, null, null);
+    }
+
+    /** Without the position fields: such an anchor is not well-formed and never verifies. */
     public SignedAnchor(String dailyRoot, String timestamp, String issuer, String algorithm,
         String keyId, String signature) {
-      this(dailyRoot, timestamp, issuer, algorithm, keyId, signature, null, null);
+      this(dailyRoot, timestamp, issuer, algorithm, keyId, signature, null, null, null, null, null);
     }
 
     public AnchorInput anchorInput() {
-      return new AnchorInput(dailyRoot, timestamp, issuer, algorithm);
+      return new AnchorInput(dailyRoot, timestamp, issuer, algorithm, seqStart, seqEnd, chainHash);
     }
   }
 
-  public record AnchorPolicy(int requiredAnchors, List<String> trustedIssuers, String quorum) {}
+  /** DEWP §5.3 default bound on an external witness's lag behind the checkpoint's claimed time. */
+  public static final long DEFAULT_MAX_ANCHOR_LAG_SECONDS = 86_400;
+  /** Tolerated witness time BEFORE the checkpoint's claimed time (producer clock ahead). */
+  public static final long ANCHOR_CLOCK_SKEW_SECONDS = 300;
+
+  /** {@code maxAnchorLagSeconds} null ⇒ {@link #DEFAULT_MAX_ANCHOR_LAG_SECONDS}. */
+  public record AnchorPolicy(int requiredAnchors, List<String> trustedIssuers, String quorum,
+      Long maxAnchorLagSeconds) {
+    public AnchorPolicy(int requiredAnchors, List<String> trustedIssuers, String quorum) {
+      this(requiredAnchors, trustedIssuers, quorum, null);
+    }
+  }
+  /** {@code witnessTimes}: authenticated external witness time per issuer (Unix seconds, earliest). */
   public record AnchorQuorumResult(boolean ok, List<String> verifiedIssuers, boolean divergence,
-      String reason, String note) {}
+      String reason, String note, Map<String, Long> witnessTimes) {}
+  /**
+   * The checkpoint anchors are counted FOR; every non-null field must equal the anchor's. One with a
+   * null {@code anchoredAt} counts no EXTERNAL witness: its time bound has nothing trusted to use.
+   */
+  public record ExpectedCheckpoint(String seqStart, String seqEnd, String chainHash, String anchoredAt) {}
+
+  /**
+   * A checkpoint record the CALLER holds — normally a chain-verified line of the published roots file
+   * (DEWP §5.4.1). Every field but {@code root} may be null; a present field is binding.
+   */
+  public record TrustedCheckpoint(String root, String seqStart, String seqEnd, Integer entryCount,
+      String anchoredAt, String chainHash) {}
+
+  /**
+   * Why a proof's prover-supplied leaf counts cannot belong to a checkpoint committing
+   * {@code entryCount} events (the sum of its blocks' leaf counts), or null (DEWP §17.3).
+   */
+  public static String leafCountMismatch(InclusionProof p, Integer entryCount) {
+    if (entryCount == null || entryCount < 0) return null;
+    long n = entryCount, block = p.blockLeafCount(), cps = p.checkpointLeafCount();
+    if (cps > n || block + cps - 1 > n || (cps == 1 && block != n))
+      return "proof claims " + block + " leaves in its block and " + cps
+          + " block(s) under the checkpoint, which cannot sum to the checkpoint's " + n + " committed events";
+    return null;
+  }
 
   /** Full §5.2 verifier for ES256, Ed25519 and RSA-PSS. Unknown algorithms fail closed. */
   public static boolean verifyAnchorSignature(SignedAnchor anchor, PublicKey key) {
     try {
+      if (anchor == null || !isWellFormedAnchor(anchor.anchorInput())) return false;
       byte[] sig = Base64.getDecoder().decode(anchor.signature());
       Signature verifier;
       switch (anchor.algorithm()) {
@@ -345,49 +433,18 @@ public final class Ledger {
         }
         case "Ed25519" -> verifier = Signature.getInstance("Ed25519");
         case "RSA-PSS" -> {
-          if (!(key instanceof java.security.interfaces.RSAPublicKey rsa)) return false;
-          int saltLength = pssSaltLength(rsa, sig);
-          if (saltLength < 0) return false;
+          // DEWP §5.2 RSA-PSS profile: a modulus of at least 2048 bits, SHA-256 with MGF1-SHA-256
+          // and a salt exactly the hash length. The salt used to be recovered from the signature
+          // and accepted at any length.
+          if (!(key instanceof java.security.interfaces.RSAPublicKey rsa)
+              || rsa.getModulus().bitLength() < 2048) return false;
           verifier = Signature.getInstance("RSASSA-PSS");
-          verifier.setParameter(new PSSParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, saltLength, 1));
+          verifier.setParameter(new PSSParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, 32, 1));
         }
         default -> { return false; }
       }
       verifier.initVerify(key); verifier.update(anchorDigest(anchor.anchorInput())); return verifier.verify(sig);
     } catch (Exception e) { return false; }
-  }
-
-  /**
-   * Recover only the PSS salt length so the JDK can verify with the same AUTO-salt semantics as
-   * Node/OpenSSL. This is not an acceptance check: Signature.verify still verifies the entire
-   * encoding and message. RFC 8017 section 9.1.2, SHA-256/MGF1-SHA256.
-   */
-  private static int pssSaltLength(java.security.interfaces.RSAPublicKey key, byte[] signature)
-      throws java.security.GeneralSecurityException {
-    int bits = key.getModulus().bitLength() - 1;
-    int length = (bits + 7) / 8;
-    if (length < 34 || signature.length != (key.getModulus().bitLength() + 7) / 8) return -1;
-    var value = new java.math.BigInteger(1, signature);
-    if (value.compareTo(key.getModulus()) >= 0) return -1;
-    byte[] recovered = value.modPow(key.getPublicExponent(), key.getModulus()).toByteArray();
-    int offset = recovered.length > 1 && recovered[0] == 0 ? 1 : 0;
-    if (recovered.length - offset > length) return -1;
-    byte[] em = new byte[length];
-    System.arraycopy(recovered, offset, em, length - recovered.length + offset, recovered.length - offset);
-    if ((em[length - 1] & 255) != 0xbc) return -1;
-    int dbLength = length - 33;
-    byte[] h = Arrays.copyOfRange(em, dbLength, length - 1);
-    byte[] db = Arrays.copyOf(em, dbLength);
-    var hash = java.security.MessageDigest.getInstance("SHA-256");
-    for (int i = 0, pos = 0; pos < dbLength; i++) {
-      hash.update(h);
-      byte[] mask = hash.digest(java.nio.ByteBuffer.allocate(4).putInt(i).array());
-      for (int j = 0; j < mask.length && pos < dbLength; j++, pos++) db[pos] ^= mask[j];
-    }
-    db[0] &= (byte) (0xff >>> (8 * length - bits));
-    int delimiter = 0;
-    while (delimiter < dbLength && db[delimiter] == 0) delimiter++;
-    return delimiter < dbLength && db[delimiter] == 1 ? dbLength - delimiter - 1 : -1;
   }
 
   /** Parses a PEM or base64 SPKI public key for the declared anchor algorithm. */
@@ -406,35 +463,135 @@ public final class Ledger {
       List<SignedAnchor> anchors, String dailyRoot, AnchorPolicy policy,
       Function<SignedAnchor, PublicKey> resolver, List<SignedAnchor> divergenceAnchors,
       String rekorPublicKey) {
+    return verifyAnchorQuorum(anchors, dailyRoot, policy, resolver, divergenceAnchors, rekorPublicKey, null, null);
+  }
+
+  public static AnchorQuorumResult verifyAnchorQuorum(
+      List<SignedAnchor> anchors, String dailyRoot, AnchorPolicy policy,
+      Function<SignedAnchor, PublicKey> resolver, List<SignedAnchor> divergenceAnchors,
+      String rekorPublicKey, Map<String,Rfc3161.Trust> rfc3161Trust) {
+    return verifyAnchorQuorum(anchors, dailyRoot, policy, resolver, divergenceAnchors, rekorPublicKey, rfc3161Trust, null);
+  }
+
+  public static AnchorQuorumResult verifyAnchorQuorum(
+      List<SignedAnchor> anchors, String dailyRoot, AnchorPolicy policy,
+      Function<SignedAnchor, PublicKey> resolver, List<SignedAnchor> divergenceAnchors,
+      String rekorPublicKey, Map<String,Rfc3161.Trust> rfc3161Trust, String rekorIssuer) {
+    return verifyAnchorQuorum(anchors, dailyRoot, policy, resolver, divergenceAnchors, rekorPublicKey,
+        rfc3161Trust, rekorIssuer, null, null);
+  }
+
+  /**
+   * Counts an anchor only when its evidence verifies under caller trust, its signed position matches
+   * {@code expected} where known, and an external witness time lies within
+   * [-ANCHOR_CLOCK_SKEW_SECONDS, maxAnchorLagSeconds] of the checkpoint's claimed time (DEWP §5.3).
+   * {@code rekorSubmitterKeys} pins the producer's Rekor submission key(s).
+   */
+  public static AnchorQuorumResult verifyAnchorQuorum(
+      List<SignedAnchor> anchors, String dailyRoot, AnchorPolicy policy,
+      Function<SignedAnchor, PublicKey> resolver, List<SignedAnchor> divergenceAnchors,
+      String rekorPublicKey, Map<String,Rfc3161.Trust> rfc3161Trust, String rekorIssuer,
+      List<String> rekorSubmitterKeys, ExpectedCheckpoint expected) {
     try {
-      return verifyAnchorQuorumChecked(anchors, dailyRoot, policy, resolver, divergenceAnchors, rekorPublicKey);
+      return verifyAnchorQuorumChecked(anchors, dailyRoot, policy, resolver, divergenceAnchors, rekorPublicKey,
+          rfc3161Trust, rekorIssuer, rekorSubmitterKeys, expected);
     } catch (RuntimeException e) {
-      return new AnchorQuorumResult(false, List.of(), false, "malformed anchor quorum input", null);
+      return new AnchorQuorumResult(false, List.of(), false, "malformed anchor quorum input", null, Map.of());
     }
   }
+
+  private static String positionMismatch(SignedAnchor a, ExpectedCheckpoint e) {
+    if (e == null) return null;
+    if (e.seqStart() != null && !e.seqStart().equals(a.seqStart())) return "seqStart";
+    if (e.seqEnd() != null && !e.seqEnd().equals(a.seqEnd())) return "seqEnd";
+    if (e.chainHash() != null && !e.chainHash().equals(a.chainHash())) return "chainHash";
+    if (e.anchoredAt() != null && !e.anchoredAt().equals(a.timestamp())) return "timestamp";
+    return null;
+  }
+
+  /** The §5.3 lag window around the anchor's own signed checkpoint time. */
+  private static boolean withinWitnessBound(SignedAnchor a, long witnessSeconds, long maxLagSeconds) {
+    long lag = witnessSeconds * 1000 - parseAnchorTimestampMs(a.timestamp());
+    return lag >= -ANCHOR_CLOCK_SKEW_SECONDS * 1000 && lag <= maxLagSeconds * 1000;
+  }
+
+  /** Verified, with the external witness time in Unix seconds (null for SELF). */
+  private record Witnessed(boolean ok, Long time) {}
 
   private static AnchorQuorumResult verifyAnchorQuorumChecked(
       List<SignedAnchor> anchors, String dailyRoot, AnchorPolicy policy,
       Function<SignedAnchor, PublicKey> resolver, List<SignedAnchor> divergenceAnchors,
-      String rekorPublicKey) {
+      String rekorPublicKey, Map<String,Rfc3161.Trust> rfc3161Trust, String rekorIssuer,
+      List<String> rekorSubmitterKeys, ExpectedCheckpoint expected) {
     if (policy == null || policy.requiredAnchors() < 1 || policy.trustedIssuers() == null
         || !("ALL_MUST_AGREE".equals(policy.quorum()) || "N_OF_M".equals(policy.quorum())))
-      return new AnchorQuorumResult(false, List.of(), false, "requiredAnchors must be at least 1", null);
+      return new AnchorQuorumResult(false, List.of(), false, "requiredAnchors must be at least 1", null, Map.of());
     Set<String> trusted = Set.copyOf(policy.trustedIssuers());
+    boolean scopedRekor = rekorIssuer != null || trusted.size() == 1;
+    Function<SignedAnchor, Witnessed> verify = a -> {
+      if (!isWellFormedAnchor(a.anchorInput())) return new Witnessed(false, null);
+      String kind = a.kind() == null ? "SELF" : a.kind();
+      if ("REKOR".equals(kind)) {
+        if (!scopedRekor || (rekorIssuer != null && !rekorIssuer.equals(a.issuer())) || rekorPublicKey == null)
+          return new Witnessed(false, null);
+        Rekor.Verification v = Rekor.verifyAnchor(a, rekorPublicKey, rekorSubmitterKeys);
+        return new Witnessed(v.ok() && v.integratedTime() != null, v.integratedTime());
+      }
+      if ("RFC3161".equals(kind)) {
+        if (rfc3161Trust == null || !rfc3161Trust.containsKey(a.issuer())) return new Witnessed(false, null);
+        Rfc3161.Verification v = Rfc3161.verifyAnchor(a, rfc3161Trust.get(a.issuer()));
+        return new Witnessed(v.ok() && v.genTime() != null, v.genTime());
+      }
+      if ("SELF".equals(kind)) {
+        PublicKey k = resolver == null ? null : resolver.apply(a);
+        return new Witnessed(k != null && verifyAnchorSignature(a, k), null);
+      }
+      return new Witnessed(false, null);
+    };
+    long maxLag = policy.maxAnchorLagSeconds() == null ? DEFAULT_MAX_ANCHOR_LAG_SECONDS : policy.maxAnchorLagSeconds();
+    // Divergence is fatal, so its evidence meets the quorum rules (DEWP §5.3): this checkpoint's seq
+    // range, an external witness inside the time bound of the anchor's signed time, and — for Rekor,
+    // which logs any digest anyone submits — a pinned producer submission key. Chain hash and claimed
+    // time are not compared: both commit to the root, so a rewritten checkpoint differs in them.
     if (divergenceAnchors != null) for (SignedAnchor a : divergenceAnchors) {
       if (!trusted.contains(a.issuer()) || dailyRoot.equals(a.dailyRoot())) continue;
-      PublicKey k = resolver == null ? null : resolver.apply(a);
-      if (k != null && verifyAnchorSignature(a, k)) return new AnchorQuorumResult(false, List.of(), true,
-          "anchor divergence: issuer " + a.issuer() + " signed a different root for this checkpoint", null);
+      // An anchor whose own signed range names another checkpoint is not divergence evidence.
+      if (expected != null && ((expected.seqStart() != null && !expected.seqStart().equals(a.seqStart()))
+          || (expected.seqEnd() != null && !expected.seqEnd().equals(a.seqEnd())))) continue;
+      if ("REKOR".equals(a.kind()) && (rekorSubmitterKeys == null || rekorSubmitterKeys.isEmpty())) continue;
+      Witnessed w = verify.apply(a);
+      if (w.ok() && w.time() != null && !withinWitnessBound(a, w.time(), maxLag)) continue;
+      if (w.ok()) return new AnchorQuorumResult(false, List.of(), true,
+          "anchor divergence: issuer " + a.issuer() + " signed a different root for this checkpoint", null, Map.of());
     }
-    Set<String> verified = new LinkedHashSet<>(); boolean tsa = false;
+    Set<String> verified = new LinkedHashSet<>(); boolean tsaUnverified = false;
+    Map<String, Long> witnessTimes = new java.util.TreeMap<>();
+    List<String> notes = new ArrayList<>();
     for (SignedAnchor a : anchors == null ? List.<SignedAnchor>of() : anchors) {
-      if (!dailyRoot.equals(a.dailyRoot()) || !trusted.contains(a.issuer()) || verified.contains(a.issuer())) continue;
-      String kind = a.kind() == null ? "SELF" : a.kind(); boolean ok = false;
-      if ("SELF".equals(kind)) { PublicKey k = resolver == null ? null : resolver.apply(a); ok = k != null && verifyAnchorSignature(a, k); }
-      else if ("REKOR".equals(kind) && rekorPublicKey != null) ok = Rekor.verifyAnchor(a, rekorPublicKey).ok();
-      else if ("RFC3161".equals(kind)) tsa = true;
-      if (ok) verified.add(a.issuer());
+      if (!dailyRoot.equals(a.dailyRoot()) || !trusted.contains(a.issuer())) continue;
+      String mismatch = positionMismatch(a, expected);
+      if (mismatch != null) {
+        notes.add("anchor from " + a.issuer() + " binds a different checkpoint " + mismatch + "; it does not count");
+        continue;
+      }
+      Witnessed w = verify.apply(a);
+      if ("RFC3161".equals(a.kind()) && !w.ok()) tsaUnverified = true;
+      if (!w.ok()) continue;
+      if (w.time() != null) {
+        witnessTimes.merge(a.issuer(), w.time(), Math::min);
+        // A checkpoint named without its time leaves only the anchor's producer-chosen timestamp to
+        // bound the witness against, which bounds nothing (DEWP §5.3).
+        if (expected != null && expected.anchoredAt() == null) {
+          notes.add("anchor from " + a.issuer() + " has an external witness time but no trusted checkpoint time to hold it to (DEWP §5.3); it does not count");
+          continue;
+        }
+        long lag = w.time() * 1000 - parseAnchorTimestampMs(a.timestamp());
+        if (!withinWitnessBound(a, w.time(), maxLag)) {
+          notes.add("anchor from " + a.issuer() + " was witnessed " + (lag / 1000) + "s from its checkpoint time; it does not count");
+          continue;
+        }
+      }
+      verified.add(a.issuer());
     }
     List<String> issuers = new ArrayList<>(verified); issuers.sort(String::compareTo);
     long present = (anchors == null ? List.<SignedAnchor>of() : anchors).stream()
@@ -443,8 +600,9 @@ public final class Ledger {
     long need = "ALL_MUST_AGREE".equals(policy.quorum())
         ? Math.max(policy.requiredAnchors(), present) : policy.requiredAnchors();
     boolean ok = issuers.size() >= need;
+    if (tsaUnverified) notes.add("RFC 3161 evidence not verified; configure RFC3161 trust/OpenSSL or inspect evidence");
     return new AnchorQuorumResult(ok, issuers, false, ok ? null : "anchor quorum not met (" + issuers.size() + "/" + need + ")",
-        tsa ? "RFC 3161 evidence is present but this zero-dependency verifier cannot evaluate CMS TimeStampTokens" : null);
+        notes.isEmpty() ? null : String.join("; ", notes), witnessTimes);
   }
 
   public static final int CHAIN_TAG = 0x04;

@@ -32,6 +32,19 @@ final class ExtendedParityTest {
     assertFalse(Ledger.verifyRootsChain(List.of(legacy)).ok());
   }
 
+  @Test void anchorPositionAndTimestampAreRequiredAndStrict() {
+    // The seq range and chain hash are part of the signed preimage (DEWP §5.2); without them an
+    // anchor is not well-formed and never verifies, whatever key it is checked under.
+    var positionless = new Ledger.SignedAnchor("a".repeat(64),"2026-09-15T00:00:00.000Z","did:x","ES256","k","AA==");
+    assertFalse(Ledger.isWellFormedAnchor(positionless.anchorInput()));
+    var positioned = new Ledger.AnchorInput("a".repeat(64),"2026-09-15T00:00:00.000Z","did:x","ES256","1","10","c".repeat(64));
+    assertTrue(Ledger.isWellFormedAnchor(positioned));
+    assertEquals(1_788_264_000_000L, Ledger.parseAnchorTimestampMs("2026-09-01T12:00:00.000Z"));
+    assertNull(Ledger.parseAnchorTimestampMs("2026-02-30T00:00:00.000Z"));
+    assertNull(Ledger.parseAnchorTimestampMs("2026-09-16T00:00:00Z"));
+    assertNull(Ledger.parseAnchorTimestampMs("2026-09-16T00:00:60.000Z"));
+  }
+
   @Test void unknownAnchorAlgorithmFailsClosed() {
     var a = new Ledger.SignedAnchor("a".repeat(64),"2026-09-15T00:00:00Z","did:x","UNKNOWN","k","AA==");
     assertFalse(Ledger.verifyAnchorSignature(a, (java.security.PublicKey) null));

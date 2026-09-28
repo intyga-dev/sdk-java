@@ -3,8 +3,11 @@ package com.intyga.sdk;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.IOException;
+import java.net.InetAddress;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.URLEncoder;
+import java.net.UnknownHostException;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -69,6 +72,7 @@ public final class IntygaClient {
     if (b.gatewayUrl == null || b.gatewayUrl.isBlank()) {
       throw new IllegalArgumentException("gatewayUrl is required");
     }
+    requireSecureGatewayUrl(b.gatewayUrl);
     String url = b.gatewayUrl;
     while (url.endsWith("/")) {
       url = url.substring(0, url.length() - 1);
@@ -86,6 +90,65 @@ public final class IntygaClient {
 
   public static Builder builder() {
     return new Builder();
+  }
+
+  /**
+   * Refuses a gateway URL that is not {@code https://}, except {@code http://} to a loopback host
+   * ({@code localhost}, {@code 127.0.0.0/8}, {@code ::1}) for local development: every request
+   * carries a bearer token or client secret. The same rule every Intyga client applies (TypeScript,
+   * Go, Rust, Python) — change them together.
+   */
+  static void requireSecureGatewayUrl(String raw) {
+    URI uri;
+    try {
+      uri = new URI(raw);
+    } catch (URISyntaxException e) {
+      throw new IllegalArgumentException("gatewayUrl is not a valid URL: " + raw);
+    }
+    String scheme = uri.getScheme();
+    String host = uri.getHost();
+    if (scheme == null || host == null || host.isEmpty()) {
+      throw new IllegalArgumentException("gatewayUrl is not a valid absolute URL: " + raw);
+    }
+    if ("https".equalsIgnoreCase(scheme)) {
+      return;
+    }
+    if ("http".equalsIgnoreCase(scheme) && isLoopbackHost(host)) {
+      return;
+    }
+    throw new IllegalArgumentException(
+        "gatewayUrl must use https:// (got "
+            + scheme
+            + "://"
+            + host
+            + "): Intyga clients send credentials on every request and refuse plain http except"
+            + " to a loopback host (localhost, 127.0.0.0/8, ::1) for local development");
+  }
+
+  /** {@code host} as {@link URI#getHost()} returns it: IPv6 literals keep their brackets. */
+  private static boolean isLoopbackHost(String host) {
+    if (host.equalsIgnoreCase("localhost")) {
+      return true;
+    }
+    if (host.startsWith("[") && host.endsWith("]")) {
+      try {
+        // A bracketed literal is parsed, never resolved: getByName does no DNS lookup for it.
+        InetAddress addr = InetAddress.getByName(host.substring(1, host.length() - 1));
+        return addr instanceof java.net.Inet6Address && addr.isLoopbackAddress();
+      } catch (UnknownHostException e) {
+        return false;
+      }
+    }
+    String[] octets = host.split("\\.", -1);
+    if (octets.length != 4) {
+      return false;
+    }
+    for (String o : octets) {
+      if (!o.matches("[0-9]{1,3}") || Integer.parseInt(o) > 255) {
+        return false;
+      }
+    }
+    return octets[0].equals("127");
   }
 
   /**
@@ -218,20 +281,24 @@ public final class IntygaClient {
             .timeoutSeconds((int) ((timeout.toMillis() + 999) / 1000))
             .build();
 
+    long deadlineNanos = System.nanoTime() + timeout.toNanos();
     AuthorizeResponse authRes = authorize(actionDescription, authOptions);
     String nonce = authRes.nonce();
 
-    long deadlineNanos = System.nanoTime() + timeout.toNanos();
     int consecutiveErrors = 0;
     while (true) {
+      if (System.nanoTime() - deadlineNanos >= 0)
+        return new ApprovalResult(ApprovalStatus.EXPIRED, null, null, nonce, authRes.agentContext());
       // A human approval can outlast a transient 502 or socket hangup — don't discard the whole
       // wait over one bad poll. Only give up once the gateway looks genuinely unreachable, and
       // rethrow the typed exception so refusal-vs-outage survives to the caller.
       try {
         ApprovalResult r = status(nonce);
+        if (System.nanoTime() - deadlineNanos >= 0)
+          return new ApprovalResult(ApprovalStatus.EXPIRED, null, null, nonce, authRes.agentContext());
         consecutiveErrors = 0;
         if (r.status() != ApprovalStatus.PENDING) {
-          return r.withNonce(nonce);
+          return r.withChallenge(nonce, authRes.agentContext());
         }
       } catch (IntygaException e) {
         consecutiveErrors++;
@@ -240,11 +307,11 @@ public final class IntygaClient {
         }
       }
 
-      if (System.nanoTime() > deadlineNanos) {
-        return new ApprovalResult(ApprovalStatus.EXPIRED, null, null, nonce);
+      if (System.nanoTime() - deadlineNanos >= 0) {
+        return new ApprovalResult(ApprovalStatus.EXPIRED, null, null, nonce, authRes.agentContext());
       }
       try {
-        Thread.sleep(interval.toMillis());
+        java.util.concurrent.TimeUnit.NANOSECONDS.sleep(Math.max(0, Math.min(interval.toNanos(), deadlineNanos - System.nanoTime())));
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
         throw new GatewayUnreachableException("interrupted while waiting for approval", e);
@@ -303,11 +370,11 @@ public final class IntygaClient {
 
   private <T> T doJson(
       String method, String path, Object body, Class<T> type, String op, boolean retried) {
-    String bearer = token();
+    String bearer = op.equals("verify") ? null : token();
     HttpRequest.Builder builder =
         HttpRequest.newBuilder(URI.create(gatewayUrl + path))
-            .timeout(REQUEST_TIMEOUT)
-            .header("authorization", "Bearer " + bearer);
+            .timeout(REQUEST_TIMEOUT);
+    if (bearer != null) builder.header("authorization", "Bearer " + bearer);
     if (body != null) {
       builder
           .header("content-type", "application/json")
@@ -319,7 +386,7 @@ public final class IntygaClient {
     // A 401 on a token WE exchanged means it aged out (clock skew, a shortened gateway TTL) —
     // evict it and re-exchange, exactly once. An explicit token is never retried: there is nothing
     // to re-exchange, and looping on a revoked credential would only hide the refusal.
-    if (res.statusCode() == 401 && !retried && usesExchangedToken()) {
+    if (res.statusCode() == 401 && bearer != null && !retried && usesExchangedToken()) {
       evictIfCurrent(bearer);
       return doJson(method, path, body, type, op, true);
     }
@@ -389,7 +456,11 @@ public final class IntygaClient {
 
     private Builder() {}
 
-    /** Base URL of the gateway, e.g. {@code https://api.intyga.com}. Required. */
+    /**
+     * Base URL of the gateway, e.g. {@code https://api.intyga.com}. Required, and must be {@code
+     * https://}; {@code http://} is accepted only for a loopback host, for local development.
+     * {@link #build()} throws {@link IllegalArgumentException} otherwise.
+     */
     public Builder gatewayUrl(String gatewayUrl) {
       this.gatewayUrl = gatewayUrl;
       return this;
