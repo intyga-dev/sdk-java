@@ -152,3 +152,29 @@ For a full client that *requests* approvals (not just verifies them), see [`sdk-
 ## License
 
 Apache-2.0.
+
+
+### Audit event signatures
+
+The `trust.intyga.audit.v1` profile carries WebAuthn assertion data in the committed
+`canonical.metadata.webauthn.authenticatorData` and `clientDataJSON` fields. Both single-proof and
+bulk-evidence verification check these assertions when given caller-owned signer trust. This is a
+signature over the exact `signedPayload`, not approval quorum, action authorization, hardware
+attestation, current credential status or proof that the deploy executed. Verify the full DIV receipt
+against the expected operation and approval policy for those authorization checks.
+
+The per-event signature result distinguishes `verified`, `invalid`, `not_checked` (missing trust,
+missing material or unsupported algorithm) and `not_applicable` (unsigned/system or AUTO_APPROVED).
+A reason accompanies each status. `trusted: true` requires a valid signature under a caller-supplied
+key mapped to that signer DID. WebAuthn requires caller-selected origin and RP ID, user presence and
+user verification, and refuses cross-origin assertions. Supply COSE keys for WebAuthn and SPKI keys
+for ES256. Multiple keys per DID support deliberate key rotation; the evidence's key is never added
+to the caller's trusted set.
+
+Without a signature policy, legacy ES256 checks still use the embedded key and report `trusted: false`;
+WebAuthn reports `not_checked`. Diagnostic ledger validity does not imply signature validity. The
+strict signature option requires **every selected entry** to have a verified, caller-trusted signature;
+unsigned, redacted, incomplete and invalid entries fail that option. Anchor quorum is a separate policy.
+
+Pass `new AuditSignatures.Policy(trustedSigners, expectedOrigin, expectedRpId)` and the
+`requireSignatures` boolean in the full `Dewp.BundleOptions` / `Dewp.EvidenceOptions` constructors.
