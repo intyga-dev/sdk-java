@@ -10,7 +10,7 @@
   <packaging>jar</packaging>
 
   <name>intyga-verify</name>
-  <description>Offline verifier for Intyga approval receipts and DEWP audit proofs (Core Profile) — no Intyga secret, no network</description>
+  <description>Offline verifier for INTYGA approval receipts and DEWP audit proofs (Core Profile) — no INTYGA secret, no network</description>
   <url>https://www.intyga.com</url>
   <licenses>
     <license>
@@ -18,8 +18,17 @@
       <url>https://www.apache.org/licenses/LICENSE-2.0</url>
     </license>
   </licenses>
+  <developers>
+    <developer>
+      <id>intyga</id>
+      <name>INTYGA</name>
+      <url>https://www.intyga.com</url>
+    </developer>
+  </developers>
   <scm>
     <url>https://github.com/intyga-dev/verify-java</url>
+    <connection>scm:git:https://github.com/intyga-dev/verify-java.git</connection>
+    <developerConnection>scm:git:ssh://git@github.com/intyga-dev/verify-java.git</developerConnection>
   </scm>
 
   <properties>
@@ -48,6 +57,16 @@
   </dependencies>
 
   <build>
+    <resources>
+      <resource>
+        <directory>${project.basedir}</directory>
+        <targetPath>META-INF</targetPath>
+        <includes>
+          <include>LICENSE</include>
+          <include>CHANGELOG.md</include>
+        </includes>
+      </resource>
+    </resources>
     <plugins>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
@@ -78,4 +97,43 @@
       </plugin>
     </plugins>
   </build>
+
+  <!-- Builds the unsigned Central artefacts. Signing and upload belong to the separate enforcer;
+       no publishing plugin or registry credential runs in this source repository. -->
+  <profiles>
+    <profile>
+      <id>release</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-source-plugin</artifactId>
+            <version>3.3.1</version>
+            <executions>
+              <execution>
+                <id>attach-sources</id>
+                <goals><goal>jar-no-fork</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-javadoc-plugin</artifactId>
+            <version>3.12.0</version>
+            <configuration>
+              <!-- Validate HTML and references; existing public APIs do not all carry every
+                   optional @param/@return tag. -->
+              <doclint>all,-missing</doclint>
+            </configuration>
+            <executions>
+              <execution>
+                <id>attach-javadocs</id>
+                <goals><goal>jar</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 </project>

@@ -10,7 +10,7 @@
   <version>1.0.0</version>
   <packaging>pom</packaging>
   <name>intyga-sdk-parent</name>
-  <description>Reactor build for the Intyga Java client and its bundled offline verifier</description>
+  <description>Reactor build for the INTYGA Java client and its bundled offline verifier</description>
   <modules>
     <module>verify</module>
     <module>sdk</module>
