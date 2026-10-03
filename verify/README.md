@@ -4,8 +4,6 @@ Independently confirm that a human cryptographically approved **exactly** the ac
 
 Java 17 or newer. One declared runtime dependency — `jackson-databind`, for JSON, since Java has no stdlib JSON — which brings `jackson-core` and `jackson-annotations` transitively, so three jars in total. All cryptography is the JDK's own: SHA-256 and P-256 ECDSA, no crypto library. Its canonicalization is held byte-identical to the TypeScript, Python, Go and Rust verifiers by the shared cross-language test vectors in `packages/mcp-schemas/vectors/`.
 
-> Status: **not yet published** to Maven Central. Build it locally with `mvn install` in this directory.
-
 ## Install
 
 ```xml

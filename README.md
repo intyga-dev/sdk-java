@@ -8,8 +8,7 @@ configuration, the signed session sequence and aggregate, and a budget across se
 
 This package **bundles the offline verifier** ([`com.intyga:intyga-verify`](https://github.com/intyga-dev/verify-java)), so you can request an approval *and* independently verify the receipt without adding a second dependency.
 
-> Status: **not yet published** to Maven Central. Until then, build from source: `mvn install` at
-> this repository's root, whose aggregator reactor builds the bundled verifier before the client that
+> Building from source: `mvn install` at this repository's root, whose aggregator reactor builds the bundled verifier before the client that
 > depends on it. (Working in the INTYGA monorepo instead? There is no aggregator there — `mvn install`
 > in `packages/verify-java`, then in `packages/sdk-java`.)
 
@@ -25,7 +24,7 @@ Runtime dependencies: `com.intyga:intyga-verify` and Jackson (`jackson-databind`
 </dependency>
 ```
 
-Gradle: `implementation("com.intyga:intyga-sdk:1.0.0")` (with `mavenLocal()` until the package is published).
+Gradle: `implementation("com.intyga:intyga-sdk:1.0.0")`.
 
 ## Require a human approval before a high-risk action
 
