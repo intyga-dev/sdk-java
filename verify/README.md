@@ -10,7 +10,7 @@ Java 17 or newer. One declared runtime dependency — `jackson-databind`, for JS
 <dependency>
   <groupId>com.intyga</groupId>
   <artifactId>intyga-verify</artifactId>
-  <version>1.0.0</version>
+  <version>1.1.0</version>
 </dependency>
 ```
 

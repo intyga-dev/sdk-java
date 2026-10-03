@@ -5,6 +5,11 @@ All notable changes to `com.intyga:intyga-verify` are documented here. The forma
 
 ## [Unreleased]
 
+## [1.1.0]
+
+- No code change. The matched set moves together (`pnpm test:versions`); this release carries the
+  new `@intyga/sdk` CLI options and the `require-approval` Action update.
+
 ## [1.0.0]
 
 - Packaging: add Central developer/SCM metadata and a `release` profile producing source and Javadoc

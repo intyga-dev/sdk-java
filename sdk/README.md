@@ -20,11 +20,11 @@ Runtime dependencies: `com.intyga:intyga-verify` and Jackson (`jackson-databind`
 <dependency>
   <groupId>com.intyga</groupId>
   <artifactId>intyga-sdk</artifactId>
-  <version>1.0.0</version>
+  <version>1.1.0</version>
 </dependency>
 ```
 
-Gradle: `implementation("com.intyga:intyga-sdk:1.0.0")`.
+Gradle: `implementation("com.intyga:intyga-sdk:1.1.0")`.
 
 ## Require a human approval before a high-risk action
 
