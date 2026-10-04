@@ -1,5 +1,7 @@
 # verify-java — Offline INTYGA receipt verification for Java
 
+[![Release gated by INTYGA](https://www.intyga.com/badges/release-gated-by-intyga.svg)](https://www.intyga.com/use-cases/package-publishing)
+
 Independently confirm that a human cryptographically approved **exactly** the action you are about to run — in your own process, with no INTYGA secret and no network call. You recompute the canonical payload from your own parameters, check it byte-matches what was signed, and verify the human's **ES256** or **WebAuthn** signature.
 
 Java 17 or newer. One declared runtime dependency — `jackson-databind`, for JSON, since Java has no stdlib JSON — which brings `jackson-core` and `jackson-annotations` transitively, so three jars in total. All cryptography is the JDK's own: SHA-256 and P-256 ECDSA, no crypto library. Its canonicalization is held byte-identical to the TypeScript, Python, Go and Rust verifiers by the shared cross-language test vectors in `packages/mcp-schemas/vectors/`.
