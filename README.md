@@ -22,11 +22,11 @@ Runtime dependencies: `com.intyga:intyga-verify` and Jackson (`jackson-databind`
 <dependency>
   <groupId>com.intyga</groupId>
   <artifactId>intyga-sdk</artifactId>
-  <version>1.1.0</version>
+  <version>1.2.0</version>
 </dependency>
 ```
 
-Gradle: `implementation("com.intyga:intyga-sdk:1.1.0")`.
+Gradle: `implementation("com.intyga:intyga-sdk:1.2.0")`.
 
 ## Require a human approval before a high-risk action
 
@@ -104,6 +104,31 @@ For framework code (a Spring/Quarkus handler, a LangChain4j tool method), `requi
 - `verify(documentHash)` — public witness lookup.
 - Exceptions: `GatewayRefusedException` (the gateway answered non-2xx; carries the status) vs `GatewayUnreachableException` (could not ask at all) — kept distinct because a policy refusal handled as an outage is a policy bypass.
 - Offline verification: `com.intyga.verify.Verify.verifyApprovalReceipt(...)` — see [`verify-java`](https://github.com/intyga-dev/verify-java).
+
+### Offline approval (DIV §5a)
+
+When the gateway cannot be reached, a relying party can build the challenge itself, have the approvers sign it on a disconnected device, and verify the result locally against a trust bundle exported while the gateway was reachable. The challenge (`DIV1:`) and signature (`SIG1:`) envelopes and the on-disk layout are a shared format across every INTYGA SDK, pinned by the conformance vectors in `vectors/offline-approval-vectors.json`. Everything lives in `com.intyga.sdk.offline`.
+
+```java
+ApprovalResult r = client.requireApproval("Restart the primary database",
+    RequireApprovalOptions.builder()
+        .authorize(AuthorizeOptions.builder()
+            .target("prod-db-cluster-01").actionType("db.restart").params(params).build())
+        // Opt in for THIS call only; never as a client default.
+        .offline(OfflineApprovalOptions.builder()
+            .bundleDir(Path.of("/etc/intyga/bundle"))      // TrustBundle.save(...) while online
+            .requesterDid("did:intyga:service:oncall")
+            .collectSignatures(challenge -> collectFromApprovers(challenge.envelope()))
+            .build())
+        .build());
+if (r.status() == ApprovalStatus.OFFLINE_APPROVED) { /* a conscious decision at this call site */ }
+```
+
+- `RequireApprovalOptions.Builder.offline(...)` — the fallback runs only when the gateway could not be asked (connection failure, timeout, 5xx, repeated polling failures), never on a 4xx, `DENIED` or `EXPIRED`, and the status is `OFFLINE_APPROVED`, never `APPROVED`. A fallback that fails throws `OfflineApprovalFailedException`.
+- `OfflineApproval.useOfflineApproval(action, options)` — the whole ceremony: verify the bundle, build the challenge, call your collector, verify the signatures, buffer a record for reconciliation, redeem the nonce once.
+- `client.reconcileOfflineApprovals(bundleDir)` — report buffered approvals when connectivity returns; each is cleared only on a 2xx.
+- `OfflineApproval.signChallengeEnvelope(envelope, key, signerDid, asOf)` — the approver's side. Show the decoded challenge (`decodeChallengeEnvelope`) and have the approver confirm its verification code with the operator first.
+- Building blocks: `TrustBundle.verify` / `save` / `load` / `approverAnchor` / `requirementFor`, `TrustAnchorFile.parse`, `OfflineApproval.createOfflineChallenge`, `encodeSignatureEnvelope` / `decodeSignatureEnvelope`, `assembleOfflineReceipt`, `FileRedemptionStore`, `pendingApprovals` / `clearPendingApproval`.
 
 ## Examples
 

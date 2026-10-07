@@ -2,6 +2,12 @@ package com.intyga.sdk;
 
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.intyga.sdk.offline.OfflineAction;
+import com.intyga.sdk.offline.OfflineApproval;
+import com.intyga.sdk.offline.OfflineApprovalOptions;
+import com.intyga.sdk.offline.OfflineApprovalResult;
+import com.intyga.sdk.offline.PendingApproval;
+import com.intyga.sdk.offline.PendingApprovals;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.URI;
@@ -12,10 +18,14 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
 
@@ -267,6 +277,15 @@ public final class IntygaClient {
    *
    * <p>A timed-out wait RETURNS a result with status {@link ApprovalStatus#EXPIRED} — expiry is an
    * answer, not an error. See {@link #requireApprovalOrThrow} for the throwing form.
+   *
+   * <p>With per-call {@link RequireApprovalOptions.Builder#offline offline} options, a gateway that
+   * could not be ASKED — connection failure, timeout, a 5xx, or five consecutive polling failures —
+   * falls back to an offline approval (DIV §5a), which returns
+   * {@link ApprovalStatus#OFFLINE_APPROVED}, never {@code APPROVED}. A 4xx, DENIED or EXPIRED is a
+   * verdict and is never routed offline; neither is an agent-continuity request, nor an interrupt.
+   * Without offline options a transport failure throws exactly as it always did.
+   *
+   * @throws OfflineApprovalFailedException when the fallback ran and did not complete
    */
   public ApprovalResult requireApproval(String actionDescription, RequireApprovalOptions options) {
     Duration timeout = options.timeout();
@@ -282,10 +301,23 @@ public final class IntygaClient {
             .build();
 
     long deadlineNanos = System.nanoTime() + timeout.toNanos();
-    AuthorizeResponse authRes = authorize(actionDescription, authOptions);
+    AuthorizeResponse authRes;
+    try {
+      authRes = authorize(actionDescription, authOptions);
+    } catch (IntygaException e) {
+      // Could not even raise the challenge — the clearest "gateway is unreachable" signal there is,
+      // unless the gateway in fact answered, which offlineFallback rethrows rather than routing.
+      return offlineFallback(actionDescription, options,
+          "could not reach Intyga to request approval: " + e.getMessage(), e);
+    }
     String nonce = authRes.nonce();
 
     int consecutiveErrors = 0;
+    // The first failure in the current streak that was NOT a "could not ask" one. The fallback needs
+    // five consecutive failures OF THOSE KINDS (docs/OFFLINE-APPROVAL-SDK.md): a streak that includes
+    // a refusal is a gateway that answered, so it ends the wait with THAT error — not with whatever
+    // transport failure happened to come last, which would misreport a verdict as an outage.
+    IntygaException streakRefusal = null;
     while (true) {
       if (System.nanoTime() - deadlineNanos >= 0)
         return new ApprovalResult(ApprovalStatus.EXPIRED, null, null, nonce, authRes.agentContext());
@@ -297,13 +329,23 @@ public final class IntygaClient {
         if (System.nanoTime() - deadlineNanos >= 0)
           return new ApprovalResult(ApprovalStatus.EXPIRED, null, null, nonce, authRes.agentContext());
         consecutiveErrors = 0;
+        streakRefusal = null;
         if (r.status() != ApprovalStatus.PENDING) {
           return r.withChallenge(nonce, authRes.agentContext());
         }
       } catch (IntygaException e) {
         consecutiveErrors++;
+        if (streakRefusal == null && !couldNotAsk(e)) {
+          streakRefusal = e;
+        }
         if (consecutiveErrors >= MAX_POLL_ERRORS) {
-          throw e;
+          if (streakRefusal != null) {
+            throw streakRefusal;
+          }
+          // The gateway went away mid-wait: the same situation as failing to raise the challenge,
+          // so the same (opt-in) fallback applies — and, as there, only because we could not ASK.
+          return offlineFallback(actionDescription, options,
+              "polling failed after " + MAX_POLL_ERRORS + " consecutive errors: " + e.getMessage(), e);
         }
       }
 
@@ -328,6 +370,15 @@ public final class IntygaClient {
    */
   public ApprovalResult requireApprovalOrThrow(
       String actionDescription, RequireApprovalOptions options) {
+    // An offline approval reports OFFLINE_APPROVED, which this method's contract would turn into
+    // ApprovalRefusedException AFTER humans signed and the nonce was redeemed. Refuse the
+    // combination up front: handling an offline approval must be explicit at the call site.
+    if (options.offline() != null) {
+      throw new IllegalArgumentException(
+          "requireApprovalOrThrow does not take offline options: an offline approval returns"
+              + " OFFLINE_APPROVED, which it would throw away — use requireApproval and handle"
+              + " OFFLINE_APPROVED explicitly");
+    }
     ApprovalResult r = requireApproval(actionDescription, options);
     if (r.status() != ApprovalStatus.APPROVED) {
       String actionType = options.authorize().actionType();
@@ -336,6 +387,115 @@ public final class IntygaClient {
           r.status(), "'" + what + "' was not approved: " + r.status());
     }
     return r;
+  }
+
+  /**
+   * DIV §5a exists for the case where the gateway could not be ASKED. Everything else rethrows the
+   * original exception: a 4xx is the gateway's verdict (403 in particular is its own fail-closed
+   * "cannot resolve the approval requirement"), and treating a refusal as unreachability would turn
+   * a policy denial into a different approval route. A 5xx is infrastructure failing — exactly the
+   * "could not ask" §5a is written for. Anything that is not a transport outcome at all (a malformed
+   * response body, missing credentials, an interrupt) is not an outage and is not routed either.
+   */
+  private ApprovalResult offlineFallback(
+      String actionDescription, RequireApprovalOptions options, String cause, IntygaException e) {
+    OfflineApprovalOptions offline = options.offline();
+    if (offline == null || !couldNotAsk(e)) {
+      throw e;
+    }
+    AuthorizeOptions auth = options.authorize();
+    if (auth.agentContext() != null) {
+      throw new IntygaException(
+          "agent continuity requests cannot fall back to an unchained offline proof", e);
+    }
+    OfflineApprovalResult r =
+        OfflineApproval.useOfflineApproval(
+            new OfflineAction(
+                auth.target(),
+                auth.actionType() == null ? "" : auth.actionType(),
+                actionDescription,
+                auth.params()),
+            offline);
+    if (!r.ok()) {
+      throw new OfflineApprovalFailedException(
+          cause + " — and the offline approval did not complete: " + r.reason(), r.reason(), e);
+    }
+    return new ApprovalResult(
+        ApprovalStatus.OFFLINE_APPROVED, null, OfflineApproval.receiptJson(r.receipt()), r.nonce(), null);
+  }
+
+  private static boolean couldNotAsk(IntygaException e) {
+    if (e instanceof GatewayRefusedException refused) {
+      return refused.status() >= 500;
+    }
+    return e instanceof GatewayUnreachableException
+        && !(e.getCause() instanceof InterruptedException)
+        && !Thread.currentThread().isInterrupted();
+  }
+
+  /** {@link #reconcileOfflineApprovals(Path, Path)} with the default buffer, {@code <bundleDir>/.pending}. */
+  public ReconcileResult reconcileOfflineApprovals(Path bundleDir) {
+    return reconcileOfflineApprovals(bundleDir, null);
+  }
+
+  /**
+   * Report offline approvals that happened while the gateway was unreachable (DIV §5a.7): each
+   * buffered record is POSTed to {@code /offline-approval/reconcile} with this client's ordinary
+   * authentication, full receipt included so the gateway RE-VERIFIES it rather than taking our
+   * word for it — we are reporting on ourselves.
+   *
+   * <p>Call it on reconnect: a scheduled retry, a health-check hook, service start. Until reported,
+   * an approval exists only on this relying party's disk, indistinguishable from an unauthorized
+   * action. A record is cleared ONLY on a 2xx; a refusal or a network failure leaves it queued. A
+   * buffered file that cannot be read is counted as a failure (with its name), never skipped.
+   *
+   * @param bufferDir null means {@code <bundleDir>/.pending}
+   * @throws IntygaException when no credentials are configured — thrown up front, rather than
+   *     counted as one failure per buffered approval
+   */
+  public ReconcileResult reconcileOfflineApprovals(Path bundleDir, Path bufferDir) {
+    token();
+    int reported = 0;
+    int failed = 0;
+    List<String> reasons = new ArrayList<>();
+    PendingApprovals pending = OfflineApproval.readPendingApprovals(bundleDir, bufferDir);
+    // Counted, never skipped: an unreported approval is indistinguishable from an unauthorized one,
+    // and a record nobody can read is still an approval nobody has reported.
+    for (String name : pending.unreadable()) {
+      failed++;
+      reasons.add(name + ": unreadable pending record — report it by hand");
+    }
+    for (PendingApproval use : pending.records()) {
+      // Absent fields are omitted, as JSON.stringify omits undefined ones (no delegation, usually).
+      Map<String, Object> body = new LinkedHashMap<>();
+      body.put("nonce", use.nonce());
+      putIfSet(body, "usedAt", use.usedAt());
+      putIfSet(body, "target", use.target());
+      putIfSet(body, "actionType", use.actionType());
+      putIfSet(body, "display", use.display());
+      putIfSet(body, "receipt", use.receipt());
+      putIfSet(body, "delegationNonce", use.delegationNonce());
+      try {
+        HttpResponse<String> res = sendAuthed("POST", "/offline-approval/reconcile", body, false);
+        if (res.statusCode() >= 200 && res.statusCode() < 300) {
+          OfflineApproval.clearPendingApproval(use.nonce(), bundleDir, bufferDir);
+          reported++;
+        } else {
+          failed++;
+          reasons.add(use.nonce() + ": " + res.statusCode() + " " + res.body());
+        }
+      } catch (IntygaException e) {
+        failed++;
+        reasons.add(use.nonce() + ": " + e.getMessage());
+      }
+    }
+    return new ReconcileResult(reported, failed, List.copyOf(reasons));
+  }
+
+  private static void putIfSet(Map<String, Object> body, String name, Object value) {
+    if (value != null) {
+      body.put(name, value);
+    }
   }
 
   /**
@@ -365,12 +525,28 @@ public final class IntygaClient {
   }
 
   private <T> T doJson(String method, String path, Object body, Class<T> type, String op) {
-    return doJson(method, path, body, type, op, false);
+    HttpResponse<String> res = sendAuthed(method, path, body, op.equals("verify"));
+    if (res.statusCode() < 200 || res.statusCode() >= 300) {
+      throw new GatewayRefusedException(
+          res.statusCode(),
+          method + " " + path + " failed: " + res.statusCode() + " " + res.body());
+    }
+    return readJson(res.body(), type, op);
   }
 
-  private <T> T doJson(
-      String method, String path, Object body, Class<T> type, String op, boolean retried) {
-    String bearer = op.equals("verify") ? null : token();
+  /**
+   * One request, authenticated unless {@code anonymous}. A 401 on a token WE exchanged means it
+   * aged out (clock skew, a shortened gateway TTL) — evict it and re-exchange, exactly once. An
+   * explicit token is never retried: there is nothing to re-exchange, and looping on a revoked
+   * credential would only hide the refusal.
+   */
+  private HttpResponse<String> sendAuthed(String method, String path, Object body, boolean anonymous) {
+    return sendAuthed(method, path, body, anonymous, false);
+  }
+
+  private HttpResponse<String> sendAuthed(
+      String method, String path, Object body, boolean anonymous, boolean retried) {
+    String bearer = anonymous ? null : token();
     HttpRequest.Builder builder =
         HttpRequest.newBuilder(URI.create(gatewayUrl + path))
             .timeout(REQUEST_TIMEOUT);
@@ -383,19 +559,11 @@ public final class IntygaClient {
       builder.method(method, HttpRequest.BodyPublishers.noBody());
     }
     HttpResponse<String> res = send(builder.build());
-    // A 401 on a token WE exchanged means it aged out (clock skew, a shortened gateway TTL) —
-    // evict it and re-exchange, exactly once. An explicit token is never retried: there is nothing
-    // to re-exchange, and looping on a revoked credential would only hide the refusal.
     if (res.statusCode() == 401 && bearer != null && !retried && usesExchangedToken()) {
       evictIfCurrent(bearer);
-      return doJson(method, path, body, type, op, true);
+      return sendAuthed(method, path, body, anonymous, true);
     }
-    if (res.statusCode() < 200 || res.statusCode() >= 300) {
-      throw new GatewayRefusedException(
-          res.statusCode(),
-          method + " " + path + " failed: " + res.statusCode() + " " + res.body());
-    }
-    return readJson(res.body(), type, op);
+    return res;
   }
 
   private boolean usesExchangedToken() {
@@ -411,10 +579,29 @@ public final class IntygaClient {
     }
   }
 
+  /**
+   * One exchange. An I/O failure BEFORE the response headers means the gateway could not be asked
+   * ({@link GatewayUnreachableException}). One AFTER them — the body broke off mid-read — means it
+   * answered and the answer was unreadable: a plain {@link IntygaException}, never routed to the
+   * DIV §5a offline path (docs/OFFLINE-APPROVAL-SDK.md). The body handler's {@code apply} runs
+   * exactly when the headers arrive, so it marks the boundary; the body is still read by {@code
+   * ofString}, so timeouts behave as before.
+   */
   private HttpResponse<String> send(HttpRequest req) {
+    AtomicBoolean answered = new AtomicBoolean();
+    HttpResponse.BodyHandler<String> handler =
+        info -> {
+          answered.set(true);
+          return HttpResponse.BodyHandlers.ofString().apply(info);
+        };
     try {
-      return http.send(req, HttpResponse.BodyHandlers.ofString());
+      return http.send(req, handler);
     } catch (IOException e) {
+      if (answered.get()) {
+        throw new IntygaException(
+            req.method() + " " + req.uri() + ": the gateway answered but its response body could not"
+                + " be read: " + e.getMessage(), e);
+      }
       throw new GatewayUnreachableException(
           req.method() + " " + req.uri() + ": gateway unreachable: " + e.getMessage(), e);
     } catch (InterruptedException e) {

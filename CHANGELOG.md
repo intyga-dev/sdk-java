@@ -5,6 +5,46 @@ All notable changes to `com.intyga:intyga-sdk` are documented here. The format f
 
 ## [Unreleased]
 
+## [1.2.0]
+
+- **Offline approval (DIV §5a), the SDK half**, to the contract in `docs/OFFLINE-APPROVAL-SDK.md`,
+  in the new package `com.intyga.sdk.offline`. It passes every case of the shared
+  `offline-approval-vectors.json` on JDK 17 and 21. No new dependency: JDK crypto and Jackson only.
+  - Trust bundles: `TrustBundle.verify` (RS256 compact JWS against a pinned RSA JWK; the header
+    cannot choose the algorithm), `checkFreshness` (expiry plus the inclusive 30-day age cap, under
+    the strict DIV §6.2 timestamp grammar), `save` / `load` (private files), `approverAnchor` /
+    `approverDirectory` (offline signing keys only under `AnchorPurpose.OFFLINE_INTENT`) and
+    `requirementFor` (exact-ID v3 selection; refuses on any conflict). The policy checks are public
+    in `ApprovalPolicy`: `validateExactApprovalPolicy`, `lostApprovalConstraints`,
+    `selectExactApprovalRule`, `validApprovalActionId`, with `ApprovalPolicyConflict`.
+  - Trust-anchor files: `TrustAnchorFile.parse(text, TrustAnchorPurpose)` (`ONLINE` default, or
+    `OFFLINE`), refusing with `InvalidTrustAnchorException`.
+  - Ceremony: `OfflineApproval.createOfflineChallenge` (requirement from the bundle, never the
+    caller; timestamps exactly as JavaScript's `toISOString()`; a supplied empty nonce is refused,
+    never replaced; a blank target is refused), `decodeChallengeEnvelope` (shapes before bytes:
+    the string fields must be strings, the target not blank under JavaScript `trim()` semantics,
+    `params` / `requirement` / `requester` objects),
+    `encodeSignatureEnvelope` / `decodeSignatureEnvelope` (byte-identical `SIG1:` JSON across SDKs,
+    strict base64url), `signChallengeEnvelope` (from a `PrivateKey`, a `KeyPair`, a PKCS#8 or SEC1
+    `EC PRIVATE KEY` PEM — what `openssl ecparam -genkey` writes — or DER PKCS#8; other curves and
+    encrypted keys are refused; the envelope's SPKI is derived from the private key), `signingPublicKey`,
+    `assembleOfflineReceipt`, `verificationCode`.
+  - `OfflineApproval.useOfflineApproval` runs the whole approval: delegation pick-up (name order),
+    signature collection, verification with the offline opt-in against the bundle rule's floor,
+    buffering, then single-use redemption through `FileRedemptionStore` (exclusive create).
+    `pendingApprovals` / `readPendingApprovals` / `clearPendingApproval` read and clear the
+    reconciliation buffer. On-disk layout matches every other SDK.
+  - Client: `RequireApprovalOptions.Builder.offline(...)` opts in per call. The fallback runs only
+    when the gateway could not be asked (a connection failure or timeout, a 5xx, or five consecutive
+    polling failures of those kinds — a streak that includes a refusal rethrows its FIRST refusal),
+    never on a response whose body could not be read (an answer, not an outage), a 4xx, `DENIED`, `EXPIRED`, a local error, an interrupt or an
+    agent-continuity request, and returns the new `ApprovalStatus.OFFLINE_APPROVED`, never
+    `APPROVED`. A fallback that ran and failed throws `OfflineApprovalFailedException`.
+    `requireApprovalOrThrow` refuses offline options (it would throw an offline approval away).
+    `reconcileOfflineApprovals` reports buffered approvals, clears each only on a 2xx, and counts an
+    unreadable record as a failure rather than skipping it (`ReconcileResult`).
+- `ApprovalStatus` gains `OFFLINE_APPROVED`. An exhaustive `switch` over it needs the new case.
+
 ## [1.1.0]
 
 - No code change. The matched set moves together (`pnpm test:versions`); this release carries the
