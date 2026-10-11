@@ -6,7 +6,7 @@
 
   <groupId>com.intyga</groupId>
   <artifactId>intyga-verify</artifactId>
-  <version>1.2.0</version>
+  <version>2.0.0</version>
   <packaging>jar</packaging>
 
   <name>intyga-verify</name>
@@ -43,7 +43,7 @@
     <dependency>
       <groupId>com.fasterxml.jackson.core</groupId>
       <artifactId>jackson-databind</artifactId>
-      <version>2.22.2</version>
+      <version>2.22.3</version>
     </dependency>
     <!-- JUnit 6 runs on JUnit Platform 6, which only Surefire 3.5.3+ can launch — an older Surefire
          discovers zero tests and still reports the build green. The two versions below MUST move
@@ -71,7 +71,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-compiler-plugin</artifactId>
-        <version>3.15.0</version>
+        <version>3.16.0</version>
       </plugin>
       <!-- Pinned NOT cosmetically: Maven's super-POM binds surefire 2.12.4, which discovers zero
            JUnit tests and reports the build green — for a verifier pinned by golden vectors that
@@ -81,7 +81,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
-        <version>3.5.6</version>
+        <version>3.6.0</version>
       </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
@@ -108,7 +108,7 @@
           <plugin>
             <groupId>org.apache.maven.plugins</groupId>
             <artifactId>maven-source-plugin</artifactId>
-            <version>3.3.1</version>
+            <version>3.4.0</version>
             <executions>
               <execution>
                 <id>attach-sources</id>

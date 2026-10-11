@@ -1,6 +1,7 @@
 package com.intyga.verify;
 
 import java.time.Instant;
+import java.util.List;
 
 /**
  * Relying-party context required to verify certain receipts. The WebAuthn expectations are
@@ -16,6 +17,7 @@ public final class VerifyOptions {
   private final boolean allowExpired;
   private final boolean allowOffline;
   private final VerifiedDelegation delegation;
+  private final List<AgentAuthorityChainLink> agentAuthorityChain;
   private final Instant asOf;
   private final Integer clockSkewSeconds;
   private final boolean allowCrossOrigin;
@@ -28,6 +30,7 @@ public final class VerifyOptions {
     this.allowExpired = b.allowExpired;
     this.allowOffline = b.allowOffline;
     this.delegation = b.delegation;
+    this.agentAuthorityChain = List.copyOf(b.agentAuthorityChain);
     this.asOf = b.asOf;
     this.clockSkewSeconds = b.clockSkewSeconds;
     this.allowCrossOrigin = b.allowCrossOrigin;
@@ -69,6 +72,10 @@ public final class VerifyOptions {
     return delegation;
   }
 
+  List<AgentAuthorityChainLink> agentAuthorityChain() {
+    return agentAuthorityChain;
+  }
+
   Instant asOf() {
     return asOf;
   }
@@ -89,6 +96,7 @@ public final class VerifyOptions {
     private boolean allowExpired;
     private boolean allowOffline;
     private VerifiedDelegation delegation;
+    private List<AgentAuthorityChainLink> agentAuthorityChain = List.of();
     private Instant asOf;
     private Integer clockSkewSeconds;
     private boolean allowCrossOrigin;
@@ -149,6 +157,16 @@ public final class VerifyOptions {
      */
     public Builder delegation(VerifiedDelegation delegation) {
       this.delegation = delegation;
+      return this;
+    }
+
+    /**
+     * Supplies the independently trusted root-to-leaf authority chain required when an agent
+     * approval names {@code delegatedBy}. Each authority is checked with its own caller-pinned
+     * target, agent DID, tenant and approver anchor.
+     */
+    public Builder agentAuthorityChain(List<AgentAuthorityChainLink> chain) {
+      this.agentAuthorityChain = chain == null ? List.of() : List.copyOf(chain);
       return this;
     }
 

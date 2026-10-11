@@ -112,6 +112,10 @@ public final class OfflineApproval {
    * 15))} minutes.
    */
   public static ChallengeResult createOfflineChallenge(ChallengeRequest req) {
+    String tenantId = req.bundle().tenantId();
+    if (tenantId == null || tenantId.isEmpty()) {
+      return ChallengeResult.refuse("the verified trust bundle must contain a non-empty tenantId");
+    }
     // DIV §3 Invariant 5 (Target Isolation): a blank target binds no execution environment, so the
     // approval would verify at every relying party that also asserts it.
     if (req.target() == null || Js.trim(req.target()).isEmpty()) {
@@ -147,6 +151,9 @@ public final class OfflineApproval {
     // rule could be presented against a strict one and overwrite its quorum (DIV §5a.5).
     VerifiedDelegation delegation = req.delegation();
     ApprovalRequirement base = resolved.requirement();
+    if (delegation != null && !tenantId.equals(delegation.tenantId())) {
+      return ChallengeResult.refuse("this delegation is not bound to the verified trust bundle tenant");
+    }
     if (delegation != null && delegation.delegatedQuorum() < base.requiredApprovals()) {
       return ChallengeResult.refuse("this delegation would lower the quorum for \"" + req.actionType()
           + "\" from " + base.requiredApprovals() + " to " + delegation.delegatedQuorum()
@@ -166,8 +173,9 @@ public final class OfflineApproval {
 
     String canonicalPayload;
     try {
-      canonicalPayload = Canonical.canonicalOfflineIntentPayload(req.target(), req.actionType(),
-          req.display(), req.params(), req.requester(), requirement, nonce, challengedAt, expiresAt);
+      canonicalPayload = Canonical.canonicalOfflineIntentPayloadWithTenant(req.target(), req.actionType(),
+          req.display(), req.params(), req.requester(), requirement, nonce, challengedAt, expiresAt,
+          tenantId);
     } catch (Canonical.NonPortableValueException e) {
       return ChallengeResult.refuse("the action cannot be canonicalized portably: " + e.getMessage());
     }
@@ -184,7 +192,8 @@ public final class OfflineApproval {
         req.params(),
         req.requester(),
         requirement,
-        approverDids));
+        approverDids,
+        tenantId));
   }
 
   /**
@@ -235,8 +244,9 @@ public final class OfflineApproval {
     }
     String rebuilt;
     try {
-      rebuilt = Canonical.canonicalOfflineIntentPayload(f.target, f.actionType, f.display, f.params,
-          f.requester, f.requirement, f.nonce, f.challengedAt, f.expiresAt);
+      String tenantId = parsed.path("tenantId").isTextual() ? parsed.path("tenantId").asText() : null;
+      rebuilt = Canonical.canonicalOfflineIntentPayloadWithTenant(f.target, f.actionType, f.display, f.params,
+          f.requester, f.requirement, f.nonce, f.challengedAt, f.expiresAt, tenantId);
     } catch (RuntimeException e) {
       return DecodedChallengeResult.refuse(
           "challenge payload carries values that cannot be canonicalized — refusing to sign it");
@@ -256,7 +266,8 @@ public final class OfflineApproval {
         f.requirement,
         f.nonce,
         f.challengedAt,
-        f.expiresAt));
+        f.expiresAt,
+        parsed.path("tenantId").isTextual() ? parsed.path("tenantId").asText() : null));
   }
 
   /** Why a decoded challenge payload has the wrong shape, or null when every field is well-typed. */
@@ -514,6 +525,9 @@ public final class OfflineApproval {
     if (expiry <= JsTime.nowOr(asOf).toEpochMilli()) {
       return SignResult.refuse("this challenge has already expired — ask for a fresh one");
     }
+    if (challenge.tenantId() == null || challenge.tenantId().isEmpty()) {
+      return SignResult.refuse("legacy v1 offline challenges cannot be newly signed; tenant-bound v2 is required");
+    }
     if (signerDid == null || !signerDid.startsWith("did:")) {
       return SignResult.refuse("signerDid must be a DID");
     }
@@ -621,7 +635,8 @@ public final class OfflineApproval {
     // the ones who must have signed that entitlement away.
     VerifiedDelegation delegation = null;
     if (opts.delegationDir() != null) {
-      FoundDelegation found = findDelegation(opts.delegationDir(), bundle, expected, opts.asOf());
+      FoundDelegation found = findDelegation(
+          opts.delegationDir(), bundle, expected, opts.requesterDid(), opts.asOf());
       if (found.reason != null) {
         warn.accept("⚠ OFFLINE APPROVAL: " + found.reason);
       }
@@ -691,7 +706,8 @@ public final class OfflineApproval {
             // receipt is a div-offline-intent.
             bundle.approverAnchor(challenge.approverDids(), AnchorPurpose.OFFLINE_INTENT),
             null,
-            floorOf(ordinary.requirement())),
+            floorOf(ordinary.requirement())).withTenantId(bundle.tenantId())
+                .withRequesterDid(opts.requesterDid()),
         verifyOptions.build());
     if (!result.ok()) {
       String detail = rejected.isEmpty() ? "" : " (also discarded: " + String.join("; ", rejected) + ")";
@@ -703,7 +719,11 @@ public final class OfflineApproval {
     // Buffer BEFORE redeeming: a crash between the two must leave a pending record behind. A
     // spurious record reconciles harmlessly; the opposite order could leave a redeemed, executed
     // approval invisible to reconciliation forever.
-    bufferForReconciliation(challenge, receipt, delegation, opts, warn);
+    try {
+      bufferForReconciliation(challenge, receipt, delegation, opts);
+    } catch (IOException | RuntimeException e) {
+      return OfflineApprovalResult.refuse("could not buffer offline approval for reconciliation");
+    }
     if (!store.redeem(challenge.nonce())) {
       clearPendingApproval(challenge.nonce(), opts.bundleDir(), opts.bufferDir());
       return OfflineApprovalResult.refuse("nonce " + challenge.nonce() + " has already been redeemed here");
@@ -724,7 +744,8 @@ public final class OfflineApproval {
    * REPORTED, not silently skipped: a delegation the operator believes they hold but which does not
    * apply is exactly what they need told during an incident. Files are tried in name order.
    */
-  private static FoundDelegation findDelegation(Path dir, TrustBundle bundle, OfflineAction expected, Instant asOf) {
+  private static FoundDelegation findDelegation(
+      Path dir, TrustBundle bundle, OfflineAction expected, String requesterDid, Instant asOf) {
     ResolvedRequirement resolved = bundle.requirementFor(expected.actionType(), expected.display()).orElse(null);
     if (resolved == null) {
       return new FoundDelegation(null,
@@ -745,7 +766,12 @@ public final class OfflineApproval {
       String name = String.valueOf(file.getFileName());
       ApprovalReceipt receipt;
       try {
-        receipt = ApprovalReceipt.parse(Files.readString(file, StandardCharsets.UTF_8));
+        JsonNode artifact = Js.parse(Files.readString(file, StandardCharsets.UTF_8));
+        if (artifact != null && artifact.has("receipt")) artifact = artifact.get("receipt");
+        if (artifact == null || !artifact.isObject()) {
+          throw new IllegalArgumentException("delegation receipt must be an object");
+        }
+        receipt = ApprovalReceipt.parse(String.valueOf(artifact));
       } catch (IOException | RuntimeException e) {
         rejected.add(name + ": unreadable");
         continue;
@@ -762,8 +788,9 @@ public final class OfflineApproval {
               bundle.approverAnchor(resolved.approverDids(), AnchorPurpose.ORDINARY),
               null,
               // DIV §5 step 3d / §5a.5: the sealing requirement may not be weaker than the rule.
-              floorOf(ordinary)),
-          VerifyOptions.builder().asOf(asOf).build());
+              floorOf(ordinary)).withTenantId(bundle.tenantId()).withRequesterDid(requesterDid),
+          VerifyOptions.builder().asOf(asOf)
+              .expectedOrigin(bundle.webauthnOrigin()).expectedRpId(bundle.webauthnRpId()).build());
       if (!res.result().ok() || res.delegation() == null) {
         rejected.add(name + ": " + res.result().reason());
         continue;
@@ -805,12 +832,10 @@ public final class OfflineApproval {
   }
 
   /**
-   * Record the approval so it can be reported when the gateway is reachable again. Best effort by
-   * design: a buffering failure must never block the emergency action the operator is mid-incident
-   * on. It is warned about loudly instead.
+   * Record the approval. Failure propagates before redemption: an unrecorded action is refused.
    */
   private static void bufferForReconciliation(OfflineChallenge challenge, ApprovalReceipt receipt,
-      VerifiedDelegation delegation, OfflineApprovalOptions opts, Consumer<String> warn) {
+      VerifiedDelegation delegation, OfflineApprovalOptions opts) throws IOException {
     Path dir = bufferDir(opts.bundleDir(), opts.bufferDir());
     ObjectNode record = Js.JSON.createObjectNode();
     record.put("nonce", challenge.nonce());
@@ -822,18 +847,12 @@ public final class OfflineApproval {
     if (delegation != null && delegation.nonce() != null) {
       record.put("delegationNonce", delegation.nonce());
     }
-    try {
-      if (!isPathSafeNonce(challenge.nonce())) {
-        throw new IOException("nonce is not a safe path segment");
-      }
-      SecureFiles.ensurePrivateDir(dir);
-      SecureFiles.writePrivateFile(dir.resolve(challenge.nonce() + ".json"),
-          Js.JSON.writerWithDefaultPrettyPrinter().writeValueAsString(record) + "\n");
-    } catch (IOException | RuntimeException e) {
-      warn.accept("⚠ OFFLINE APPROVAL: could not buffer " + challenge.nonce() + " for reconciliation ("
-          + e.getMessage() + "). Report this manually — an unreported approval is indistinguishable"
-          + " from an unauthorized one.");
+    if (!isPathSafeNonce(challenge.nonce())) {
+      throw new IOException("nonce is not a safe path segment");
     }
+    SecureFiles.ensurePrivateDir(dir);
+    SecureFiles.writePrivateFile(dir.resolve(challenge.nonce() + ".json"),
+        Js.JSON.writerWithDefaultPrettyPrinter().writeValueAsString(record) + "\n");
   }
 
   /**

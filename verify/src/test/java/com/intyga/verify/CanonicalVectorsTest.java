@@ -333,7 +333,8 @@ class CanonicalVectorsTest {
     Expected expected = new Expected(base.target(), base.nonce(), base.actionType(), base.params(),
         ApproverTrustAnchor.ofDids(List.of(did), ignored -> receipt.signerPublicKey()));
     VerifiedDelegation delegation = new VerifiedDelegation(List.of(did), 1, base.target(),
-        base.actionType(), base.params(), "cached", List.of(), "2998-12-31T23:59:00Z");
+        base.actionType(), base.params(), "cached", List.of(), "2998-12-31T23:59:00Z", null,
+        receipt.requester().did());
     java.util.function.BiFunction<String, Boolean, VerifyResult> verifyAt = (at, allowExpired) ->
         Verify.verifyApprovalReceipt(receipt, expected, VerifyOptions.builder().allowOffline(true)
             .allowExpired(allowExpired).asOf(Instant.parse(at)).delegation(delegation).build());
@@ -346,7 +347,8 @@ class CanonicalVectorsTest {
         .asOf(Instant.parse("2998-12-31T23:59:31Z")).build()).ok());
     assertTrue(verifyAt.apply("2998-12-31T23:59:31Z", true).ok());
     VerifiedDelegation malformed = new VerifiedDelegation(List.of(did), 1, base.target(),
-        base.actionType(), base.params(), "cached", List.of(), "invalid");
+        base.actionType(), base.params(), "cached", List.of(), "invalid", null,
+        receipt.requester().did());
     VerifyResult invalid = Verify.verifyApprovalReceipt(receipt, expected,
         VerifyOptions.builder().allowOffline(true).allowExpired(true)
             .asOf(Instant.parse("2998-12-31T23:58:59Z")).delegation(malformed).build());

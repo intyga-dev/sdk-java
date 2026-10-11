@@ -289,6 +289,29 @@ public final class Canonical {
     return canonicalIntentPayload(target, actionType, display, params, requester, requirement, nonce, expiresAt, null);
   }
 
+  /** Adds the v2 tenant binding while retaining the exact v1 bytes when tenantId is absent. */
+  public static String withTenant(String canonical, String tenantId) {
+    if (tenantId == null) return canonical;
+    if (tenantId.isEmpty()) throw new IllegalArgumentException("tenantId must be non-empty");
+    try {
+      @SuppressWarnings("unchecked") Map<String, Object> value =
+          Records.JSON.readValue(canonical, Map.class);
+      value.put("v", Div.TENANT_VERSION);
+      value.put("tenantId", tenantId);
+      return stableStringify(value);
+    } catch (java.io.IOException e) {
+      throw new IllegalArgumentException("invalid canonical payload", e);
+    }
+  }
+
+  public static String canonicalIntentPayloadWithTenant(
+      String target, String actionType, String display, Map<String, Object> params,
+      RequesterIdentity requester, ApprovalRequirement requirement, String nonce,
+      String expiresAt, String tenantId) {
+    return withTenant(canonicalIntentPayload(target, actionType, display, params, requester,
+        requirement, nonce, expiresAt), tenantId);
+  }
+
   public static String canonicalIntentPayload(
       String target, String actionType, String display, Map<String, Object> params,
       RequesterIdentity requester, ApprovalRequirement requirement, String nonce,
@@ -356,6 +379,14 @@ public final class Canonical {
     return stableStringify(obj);
   }
 
+  public static String canonicalOfflineIntentPayloadWithTenant(
+      String target, String actionType, String display, Map<String, Object> params,
+      RequesterIdentity requester, ApprovalRequirement requirement, String nonce,
+      String challengedAt, String expiresAt, String tenantId) {
+    return withTenant(canonicalOfflineIntentPayload(target, actionType, display, params, requester,
+        requirement, nonce, challengedAt, expiresAt), tenantId);
+  }
+
   /**
    * Builds a byte-identical DELEGATION payload (DIV §5a.5) — a signed statement about WHO MAY
    * APPROVE, not about what may run. delegatedTo is sorted because it is a SET, exactly as
@@ -393,6 +424,14 @@ public final class Canonical {
     obj.put("sealedAt", nz(sealedAt));
     obj.put("expiresAt", nz(expiresAt));
     return stableStringify(obj);
+  }
+
+  public static String canonicalDelegationPayloadWithTenant(
+      String target, String actionType, String display, Map<String, Object> params,
+      RequesterIdentity requester, ApprovalRequirement requirement, List<String> delegatedTo,
+      int delegatedQuorum, String nonce, String sealedAt, String expiresAt, String tenantId) {
+    return withTenant(canonicalDelegationPayload(target, actionType, display, params, requester,
+        requirement, delegatedTo, delegatedQuorum, nonce, sealedAt, expiresAt), tenantId);
   }
 
   private Canonical() {}

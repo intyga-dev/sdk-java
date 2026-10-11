@@ -2,7 +2,7 @@ package com.intyga.sdk.offline;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.nio.channels.SeekableByteChannel;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.FileAlreadyExistsException;
@@ -85,6 +85,7 @@ final class SecureFiles {
         Files.move(temp, file, StandardCopyOption.REPLACE_EXISTING);
       }
       repairMode(file, FILE_MODE);
+      syncDirectory(dir);
     } finally {
       Files.deleteIfExists(temp);
     }
@@ -100,6 +101,7 @@ final class SecureFiles {
       ensurePrivateDir(file.toAbsolutePath().getParent());
       writeExclusive(file, contents);
       repairMode(file, FILE_MODE);
+      syncDirectory(file.toAbsolutePath().getParent());
       return true;
     } catch (IOException | RuntimeException e) {
       return false;
@@ -109,11 +111,21 @@ final class SecureFiles {
   private static void writeExclusive(Path file, String contents) throws IOException {
     Set<OpenOption> options =
         Set.of(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS);
-    try (SeekableByteChannel ch = Files.newByteChannel(file, options, attrs(FILE_MODE))) {
+    try (FileChannel ch = FileChannel.open(file, options, attrs(FILE_MODE))) {
       ByteBuffer buf = ByteBuffer.wrap(contents.getBytes(StandardCharsets.UTF_8));
       while (buf.hasRemaining()) {
         ch.write(buf);
       }
+      ch.force(true);
+    }
+  }
+
+  private static void syncDirectory(Path dir) throws IOException {
+    if (!POSIX) return; // Windows does not expose directory fsync.
+    try (FileChannel ch = FileChannel.open(dir, StandardOpenOption.READ)) { ch.force(true); }
+    Path parent = dir.getParent();
+    if (parent != null) {
+      try (FileChannel ch = FileChannel.open(parent, StandardOpenOption.READ)) { ch.force(true); }
     }
   }
 }

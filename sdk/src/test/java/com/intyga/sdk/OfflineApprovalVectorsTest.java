@@ -206,6 +206,9 @@ class OfflineApprovalVectorsTest {
     o.put("v", b.v());
     o.put("type", b.type());
     o.put("tenantId", b.tenantId());
+    if (b.webauthnOrigin() != null) {
+      o.putObject("webauthn").put("origin", b.webauthnOrigin()).put("rpId", b.webauthnRpId());
+    }
     ArrayNode approvers = o.putArray("approvers");
     for (BundleApprover a : b.approvers()) {
       ObjectNode an = approvers.addObject();
@@ -323,12 +326,20 @@ class OfflineApprovalVectorsTest {
       JsonNode limit = c.get("limitToDids");
       String label = c.get("purpose").textValue() + (limit == null || limit.isNull() ? "" : " " + limit);
       return DynamicTest.dynamicTest(label, () -> {
-        ApproverDirectory dir = bundle.approverDirectory(
-            limit == null || limit.isNull() ? null : strings(limit), purposeOf(c.get("purpose").textValue()));
+        ApproverDirectory dir = null;
+        try {
+          dir = bundle.approverDirectory(
+              limit == null || limit.isNull() ? null : strings(limit), purposeOf(c.get("purpose").textValue()));
+        } catch (IllegalArgumentException refused) {
+          assertFalse(c.get("ok").booleanValue(), label + " unexpectedly refused: " + refused.getMessage());
+        }
+        assertEquals(c.get("ok").booleanValue(), dir != null, label);
+        if (dir == null) return;
         assertEquals(strings(c.get("expect").get("dids")), dir.dids(), label);
+        ApproverDirectory checkedDir = dir;
         c.get("expect").get("keys").fields().forEachRemaining(e -> {
           List<String> want = e.getValue().isNull() ? null : strings(e.getValue());
-          assertEquals(want, dir.resolveKey(e.getKey()), label + " " + e.getKey());
+          assertEquals(want, checkedDir.resolveKey(e.getKey()), label + " " + e.getKey());
         });
         assertNotNull(dir.toTrustAnchor());
       });
@@ -366,6 +377,7 @@ class OfflineApprovalVectorsTest {
         got = JSON.createObjectNode();
         got.put("purpose", parsed.purpose().wire());
         got.put("epoch", parsed.epoch());
+        if (parsed.tenantId() != null) got.put("tenantId", parsed.tenantId());
         got.set("dids", JSON.valueToTree(dir.dids()));
         ObjectNode keys = got.putObject("keys");
         for (String did : dir.dids()) {
@@ -384,9 +396,14 @@ class OfflineApprovalVectorsTest {
 
   @TestFactory
   Stream<DynamicNode> createChallenge() {
-    TrustBundle bundle = TrustBundle.parseUnverified(V.get("bundle"));
     return cases("createChallenge").map(c -> DynamicTest.dynamicTest(name(c), () -> {
       JsonNode in = c.get("input");
+      ObjectNode bundlePayload = V.get("bundle").deepCopy();
+      if (in.has("bundleTenantId")) {
+        if (in.get("bundleTenantId").isNull()) bundlePayload.remove("tenantId");
+        else bundlePayload.set("tenantId", in.get("bundleTenantId"));
+      }
+      TrustBundle bundle = TrustBundle.parseUnverified(bundlePayload);
       ChallengeRequest.Builder req = ChallengeRequest.builder()
           .bundle(bundle)
           .target(in.get("target").textValue())
@@ -418,7 +435,8 @@ class OfflineApprovalVectorsTest {
             map(in.get("params")),
             d.get("nonce").textValue(),
             List.of(),
-            null));
+            null,
+            d.hasNonNull("tenantId") ? d.get("tenantId").textValue() : null));
       }
       ChallengeResult r = OfflineApproval.createOfflineChallenge(req.build());
       assertEquals(c.get("ok").booleanValue(), r.ok(), name(c) + ": " + r.reason());
@@ -440,6 +458,7 @@ class OfflineApprovalVectorsTest {
           case "expiresAt" -> assertEquals(want.textValue(), ch.expiresAt(), msg);
           case "requirement" -> assertEquals(requirementOf(want), ch.requirement(), msg);
           case "approverDids" -> assertEquals(strings(want), ch.approverDids(), msg);
+          case "tenantId" -> assertEquals(want.isNull() ? null : want.textValue(), ch.tenantId(), msg);
           default -> fail("createChallenge vector expects a field this harness does not check: " + field);
         }
       });
@@ -457,7 +476,7 @@ class OfflineApprovalVectorsTest {
       }
       DecodedChallenge d = r.challenge();
       JsonNode e = c.get("expect");
-      assertEquals(11, e.size(), name(c) + ": the expectation grew a field this harness does not check");
+      assertTrue(e.size() == 11 || e.size() == 12, name(c) + ": unexpected expectation fields");
       assertEquals(e.get("canonicalPayload").textValue(), d.canonicalPayload(), name(c));
       assertEquals(e.get("verificationCode").textValue(), d.verificationCode(), name(c));
       assertEquals(e.get("target").textValue(), d.target(), name(c));
@@ -469,6 +488,8 @@ class OfflineApprovalVectorsTest {
       assertEquals(e.get("nonce").textValue(), d.nonce(), name(c));
       assertEquals(e.get("challengedAt").textValue(), d.challengedAt(), name(c));
       assertEquals(e.get("expiresAt").textValue(), d.expiresAt(), name(c));
+      if (e.has("tenantId"))
+        assertEquals(e.get("tenantId").isNull() ? null : e.get("tenantId").textValue(), d.tenantId(), name(c));
     }));
   }
 
@@ -530,21 +551,31 @@ class OfflineApprovalVectorsTest {
   Stream<DynamicNode> offlineApproval() {
     return cases("offlineApproval").map(c -> DynamicTest.dynamicTest(name(c), () -> {
       Path dir = Files.createTempDirectory(scratch, "case-");
-      Files.writeString(dir.resolve("trust-bundle.jws"), V.get("bundleJws").textValue());
+      Files.writeString(dir.resolve("trust-bundle.jws"), c.path("bundleJws").asText(V.get("bundleJws").textValue()));
       Files.writeString(dir.resolve("gateway-key.jwk.json"), JSON.writeValueAsString(V.get("gatewayJwk")));
       Path delegationDir = null;
-      if (c.hasNonNull("delegation")) {
-        String delegation = c.get("delegation").textValue();
+      if (c.hasNonNull("delegation") || c.path("delegationArtifacts").isArray()) {
+        String delegation = c.path("delegation").asText();
         delegationDir = dir.resolve("delegations");
         Files.createDirectory(delegationDir);
-        Files.writeString(delegationDir.resolve(delegation + ".json"),
-            JSON.writeValueAsString(V.get("delegations").get(delegation)));
+        if (c.path("delegationArtifacts").isArray()) {
+          for (int i = 0; i < c.path("delegationArtifacts").size(); i++) {
+            Files.writeString(delegationDir.resolve(String.format("00-invalid-%02d.json", i)),
+                JSON.writeValueAsString(c.path("delegationArtifacts").get(i)));
+          }
+        }
+        if (c.hasNonNull("delegation")) {
+          Files.writeString(delegationDir.resolve(delegation + ".json"),
+              JSON.writeValueAsString(V.get("delegations").get(delegation)));
+        }
       }
       JsonNode action = c.get("action");
       List<String> warnings = new ArrayList<>();
+      String requesterDid = c.has("requesterDid")
+          ? c.get("requesterDid").textValue() : V.get("requesterDid").textValue();
       OfflineApprovalOptions.Builder opts = OfflineApprovalOptions.builder()
           .bundleDir(dir)
-          .requesterDid(V.get("requesterDid").textValue())
+          .requesterDid(requesterDid)
           .asOf(at(c))
           .warn(warnings::add)
           .collectSignatures(challenge -> {
@@ -570,6 +601,11 @@ class OfflineApprovalVectorsTest {
       if (delegationDir != null) {
         opts.delegationDir(delegationDir);
       }
+      if (c.path("bufferFailure").asBoolean()) {
+        Path buffer = dir.resolve("not-a-directory");
+        Files.writeString(buffer, "buffer failure");
+        opts.bufferDir(buffer);
+      }
       OfflineApprovalResult r = OfflineApproval.useOfflineApproval(
           new OfflineAction(
               action.get("target").textValue(),
@@ -578,6 +614,10 @@ class OfflineApprovalVectorsTest {
               map(action.get("params"))),
           opts.build());
       assertEquals(c.get("ok").booleanValue(), r.ok(), name(c) + ": " + r.reason());
+      if (c.path("bufferFailure").asBoolean()) {
+        assertTrue(r.reason().contains("could not buffer"));
+        try (var entries = Files.list(dir.resolve(".redeemed"))) { assertEquals(0, entries.count()); }
+      }
       if (!r.ok()) {
         assertNotNull(r.reason(), name(c));
         assertNull(r.receipt(), name(c));

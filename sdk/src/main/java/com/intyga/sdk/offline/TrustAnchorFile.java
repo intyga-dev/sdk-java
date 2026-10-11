@@ -35,7 +35,13 @@ public record TrustAnchorFile(
     String label,
     List<BundleApprover> approvers,
     WebAuthnExpectation webauthn,
-    String exportedAt) {
+    String exportedAt,
+    String tenantId) {
+
+  public TrustAnchorFile(TrustAnchorPurpose purpose, long epoch, String label,
+      List<BundleApprover> approvers, WebAuthnExpectation webauthn, String exportedAt) {
+    this(purpose, epoch, label, approvers, webauthn, exportedAt, null);
+  }
 
   /** The file's {@code type}. */
   public static final String TYPE = "intyga-trust-anchor";
@@ -111,6 +117,10 @@ public record TrustAnchorFile(
     if (exportedAt != null && !exportedAt.isTextual()) {
       throw new InvalidTrustAnchorException("exportedAt must be a string");
     }
+    JsonNode tenantId = obj.get("tenantId");
+    if (tenantId != null && (!tenantId.isTextual() || tenantId.textValue().isEmpty())) {
+      throw new InvalidTrustAnchorException("tenantId must be a non-empty string when present");
+    }
 
     JsonNode approvers = obj.get("approvers");
     if (approvers == null || !approvers.isArray() || approvers.isEmpty()) {
@@ -181,7 +191,8 @@ public record TrustAnchorFile(
         Js.text(label),
         List.copyOf(parsed),
         webauthn,
-        Js.text(exportedAt));
+        Js.text(exportedAt),
+        Js.text(tenantId));
   }
 
   /**

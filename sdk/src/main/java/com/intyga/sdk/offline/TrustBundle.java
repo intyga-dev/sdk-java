@@ -57,6 +57,8 @@ public final class TrustBundle {
   private final Long v;
   private final String type;
   private final String tenantId;
+  private final String webauthnOrigin;
+  private final String webauthnRpId;
   private final List<BundleApprover> approvers;
   private final List<BundlePolicy> policy;
   private final boolean policyIsList;
@@ -69,6 +71,8 @@ public final class TrustBundle {
     this.v = Js.isSafeInteger(v) ? Long.valueOf(v.longValue()) : null;
     this.type = Js.text(payload.get("type"));
     this.tenantId = Js.text(payload.get("tenantId"));
+    this.webauthnOrigin = Js.text(payload.path("webauthn").get("origin"));
+    this.webauthnRpId = Js.text(payload.path("webauthn").get("rpId"));
     List<BundleApprover> approvers = new ArrayList<>();
     JsonNode a = payload.get("approvers");
     if (a != null && a.isArray()) {
@@ -123,6 +127,10 @@ public final class TrustBundle {
   public String tenantId() {
     return tenantId;
   }
+
+  /** Expectations pinned by the bundle signature; absent in older bundles. */
+  public String webauthnOrigin() { return webauthnOrigin; }
+  public String webauthnRpId() { return webauthnRpId; }
 
   public List<BundleApprover> approvers() {
     return approvers;
@@ -217,6 +225,18 @@ public final class TrustBundle {
     }
     if (!TYPE.equals(Js.text(bundle.get("type"))) || !Js.isNumberOne(bundle.get("v"))) {
       return TrustBundleResult.refuse("unsupported trust bundle type or version");
+    }
+    String tenantId = Js.text(bundle.get("tenantId"));
+    if (tenantId == null || tenantId.isEmpty()) {
+      return TrustBundleResult.refuse("trust bundle requires a non-empty tenantId");
+    }
+    if (bundle.has("webauthn")) {
+      JsonNode pins = bundle.get("webauthn");
+      String origin = Js.text(pins.get("origin"));
+      String rpId = Js.text(pins.get("rpId"));
+      if (origin == null || origin.isEmpty() || rpId == null || rpId.isEmpty()) {
+        return TrustBundleResult.refuse("invalid trust bundle WebAuthn expectations");
+      }
     }
     String unmatched = Js.text(bundle.get("unmatchedActionPolicy"));
     if (!"DENY".equals(unmatched) && !"BASELINE".equals(unmatched)) {
@@ -386,12 +406,16 @@ public final class TrustBundle {
 
   /**
    * The DID → keys mapping for a DID-mode anchor. {@code limitToDids} narrows the eligible set
-   * (never widens it: a DID not in the bundle resolves to nothing). {@link AnchorPurpose#ORDINARY}
-   * never admits an offline signing key; pass {@link AnchorPurpose#OFFLINE_INTENT} only when the
-   * receipt being verified is a {@code div-offline-intent}.
+   * (never widens it: a DID not in the bundle resolves to nothing). {@link
+   * AnchorPurpose#OFFLINE_INTENT} requires an explicit DID restriction; {@code null} throws so
+   * every offline key in the tenant bundle cannot become eligible for one action.
    */
   public ApproverDirectory approverDirectory(List<String> limitToDids, AnchorPurpose purpose) {
     Map<String, List<String>> byDid = new LinkedHashMap<>();
+    if (purpose == AnchorPurpose.OFFLINE_INTENT && limitToDids == null) {
+      throw new IllegalArgumentException(
+          "offline-intent anchors require an explicit eligible DID restriction");
+    }
     for (BundleApprover a : approvers) {
       // A DID-less entry (possible only in an unverified bundle) can never match a signer.
       if (a.did() == null || (limitToDids != null && !limitToDids.contains(a.did()))) {

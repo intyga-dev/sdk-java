@@ -12,7 +12,7 @@ Java 17 or newer. One declared runtime dependency — `jackson-databind`, for JS
 <dependency>
   <groupId>com.intyga</groupId>
   <artifactId>intyga-verify</artifactId>
-  <version>1.2.0</version>
+  <version>2.0.0</version>
 </dependency>
 ```
 
@@ -35,7 +35,8 @@ VerifyResult res = Verify.verifyApprovalReceipt(
         nonce,
         "wipe_production",
         Map.of("database", "prod-db-1"),
-        ApproverTrustAnchor.ofPublicKeys(List.of(approverSpkiB64))),
+        ApproverTrustAnchor.ofPublicKeys(List.of(approverSpkiB64)))
+        .withTenantId(System.getenv("INTYGA_TENANT_ID")),
     // REQUIRED for passkey receipts (the normal flow): the approval console's exact origin and RP
     // ID, from the trust-anchor file exported in the console (its `webauthn` block).
     VerifyOptions.builder()

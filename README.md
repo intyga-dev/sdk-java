@@ -22,11 +22,11 @@ Runtime dependencies: `com.intyga:intyga-verify` and Jackson (`jackson-databind`
 <dependency>
   <groupId>com.intyga</groupId>
   <artifactId>intyga-sdk</artifactId>
-  <version>1.2.0</version>
+  <version>2.0.0</version>
 </dependency>
 ```
 
-Gradle: `implementation("com.intyga:intyga-sdk:1.2.0")`.
+Gradle: `implementation("com.intyga:intyga-sdk:2.0.0")`.
 
 ## Require a human approval before a high-risk action
 
@@ -65,7 +65,7 @@ if (r.status() != ApprovalStatus.APPROVED) {
 VerifyResult check = Verify.verifyApprovalReceipt(
     ApprovalReceipt.parse(r.receipt()),
     new Expected("prod-db-cluster-01", r.nonce(), "wipe_production", params,
-        ApproverTrustAnchor.ofPublicKeys(trustedApproverKeys())),
+        ApproverTrustAnchor.ofPublicKeys(trustedApproverKeys())).withTenantId(System.getenv("INTYGA_TENANT_ID")),
     // REQUIRED for passkey receipts (the normal flow): the approval console's exact origin and RP
     // ID, from the trust-anchor file exported in the console (its `webauthn` block).
     VerifyOptions.builder()
@@ -129,6 +129,9 @@ if (r.status() == ApprovalStatus.OFFLINE_APPROVED) { /* a conscious decision at 
 - `client.reconcileOfflineApprovals(bundleDir)` — report buffered approvals when connectivity returns; each is cleared only on a 2xx.
 - `OfflineApproval.signChallengeEnvelope(envelope, key, signerDid, asOf)` — the approver's side. Show the decoded challenge (`decodeChallengeEnvelope`) and have the approver confirm its verification code with the operator first.
 - Building blocks: `TrustBundle.verify` / `save` / `load` / `approverAnchor` / `requirementFor`, `TrustAnchorFile.parse`, `OfflineApproval.createOfflineChallenge`, `encodeSignatureEnvelope` / `decodeSignatureEnvelope`, `assembleOfflineReceipt`, `FileRedemptionStore`, `pendingApprovals` / `clearPendingApproval`.
+
+`TrustBundle.approverAnchor` requires an explicit eligible DID list for `OFFLINE_INTENT` and throws
+when it is null. `ORDINARY` retains null as an intentional unrestricted anchor.
 
 ## Examples
 

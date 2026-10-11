@@ -17,4 +17,18 @@ public record VerifiedDelegation(
     Map<String, Object> params,
     String nonce,
     List<String> signers,
-    String expiresAt) {}
+    String expiresAt,
+    String tenantId,
+    String requesterDid) {
+  public VerifiedDelegation(List<String> delegatedTo, int delegatedQuorum, String target,
+      String actionType, Map<String, Object> params, String nonce, List<String> signers,
+      String expiresAt, String tenantId) {
+    this(delegatedTo, delegatedQuorum, target, actionType, params, nonce, signers, expiresAt,
+        tenantId, null);
+  }
+  public VerifiedDelegation(List<String> delegatedTo, int delegatedQuorum, String target,
+      String actionType, Map<String, Object> params, String nonce, List<String> signers,
+      String expiresAt) {
+    this(delegatedTo, delegatedQuorum, target, actionType, params, nonce, signers, expiresAt, null, null);
+  }
+}

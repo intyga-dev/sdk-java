@@ -23,19 +23,36 @@ public record Expected(
     Map<String, Object> params,
     ApproverTrustAnchor approvers,
     Map<String, Object> agentContext,
-    RequirementFloor requirement) {
+    RequirementFloor requirement,
+    String tenantId,
+    String requesterDid) {
   public Expected(String target, String nonce, String actionType, Map<String, Object> params,
       ApproverTrustAnchor approvers) {
-    this(target, nonce, actionType, params, approvers, null, null);
+    this(target, nonce, actionType, params, approvers, null, null, null, null);
   }
 
   public Expected(String target, String nonce, String actionType, Map<String, Object> params,
       ApproverTrustAnchor approvers, Map<String, Object> agentContext) {
-    this(target, nonce, actionType, params, approvers, agentContext, null);
+    this(target, nonce, actionType, params, approvers, agentContext, null, null, null);
+  }
+
+  public Expected(String target, String nonce, String actionType, Map<String, Object> params,
+      ApproverTrustAnchor approvers, Map<String, Object> agentContext, RequirementFloor requirement) {
+    this(target, nonce, actionType, params, approvers, agentContext, requirement, null, null);
   }
 
   /** This expectation with the relying party's requirement floor (DIV §5 step 3d). */
   public Expected withRequirement(RequirementFloor floor) {
-    return new Expected(target, nonce, actionType, params, approvers, agentContext, floor);
+    return new Expected(target, nonce, actionType, params, approvers, agentContext, floor, tenantId, requesterDid);
+  }
+
+  /** This expectation with a caller-owned tenant binding (DIV v2). */
+  public Expected withTenantId(String value) {
+    return new Expected(target, nonce, actionType, params, approvers, agentContext, requirement, value, requesterDid);
+  }
+
+  /** This expectation with the independently asserted requester identity. */
+  public Expected withRequesterDid(String value) {
+    return new Expected(target, nonce, actionType, params, approvers, agentContext, requirement, tenantId, value);
   }
 }

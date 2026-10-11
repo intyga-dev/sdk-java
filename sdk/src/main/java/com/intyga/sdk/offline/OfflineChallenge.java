@@ -33,4 +33,5 @@ public record OfflineChallenge(
     Map<String, Object> params,
     RequesterIdentity requester,
     ApprovalRequirement requirement,
-    List<String> approverDids) {}
+    List<String> approverDids,
+    String tenantId) {}

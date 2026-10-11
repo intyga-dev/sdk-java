@@ -99,13 +99,28 @@ final class SharedParityVectorsTest {
     for (JsonNode c : section.path("cases")) {
       ObjectNode expected = section.path("expected").deepCopy();
       if (c.has("expected")) expected.setAll((ObjectNode)c.get("expected"));
-      List<String> publicKeys = new ArrayList<>();
-      // A WEBAUTHN witness verifies under the credential's COSE_Key; such cases say so explicitly.
-      String encoding = "cose".equals(c.path("approverKeyEncoding").asText()) ? "coseB64" : "spkiB64";
-      expected.path("approverKeyIds").forEach(id -> publicKeys.add(keyById.get(id.asText()).path(encoding).asText()));
+      ApproverTrustAnchor anchor;
+      if (expected.has("approverDids")) {
+        Map<String, List<String>> resolved = new HashMap<>();
+        List<String> coseDids = new ArrayList<>();
+        c.path("approverCoseDids").forEach(did -> coseDids.add(did.asText()));
+        expected.path("approverDids").fields().forEachRemaining(entry -> {
+          List<String> keys = new ArrayList<>();
+          String encoding = coseDids.contains(entry.getKey()) ? "coseB64" : "spkiB64";
+          entry.getValue().forEach(id -> keys.add(keyById.get(id.asText()).path(encoding).asText()));
+          resolved.put(entry.getKey(), keys);
+        });
+        anchor = ApproverTrustAnchor.ofDidsMultiKey(new ArrayList<>(resolved.keySet()), resolved::get);
+      } else {
+        List<String> publicKeys = new ArrayList<>();
+        // A WEBAUTHN witness verifies under the credential's COSE_Key; such cases say so explicitly.
+        String encoding = "cose".equals(c.path("approverKeyEncoding").asText()) ? "coseB64" : "spkiB64";
+        expected.path("approverKeyIds").forEach(id -> publicKeys.add(keyById.get(id.asText()).path(encoding).asText()));
+        anchor = ApproverTrustAnchor.ofPublicKeys(publicKeys);
+      }
       Map<String,Object> params = Records.JSON.convertValue(expected.path("params"), new com.fasterxml.jackson.core.type.TypeReference<Map<String,Object>>() {});
       Map<String,Object> agentContext = expected.has("agentContext") ? Records.JSON.convertValue(expected.path("agentContext"), new com.fasterxml.jackson.core.type.TypeReference<Map<String,Object>>() {}) : null;
-      Expected e = new Expected(expected.path("target").asText(), expected.path("nonce").asText(), expected.path("actionType").asText(), params, ApproverTrustAnchor.ofPublicKeys(publicKeys), agentContext, floor(expected));
+      Expected e = new Expected(expected.path("target").asText(), expected.path("nonce").asText(), expected.path("actionType").asText(), params, anchor, agentContext, floor(expected));
       var result = Verify.verifyApprovalReceipt(ApprovalReceipt.parse(c.path("receipt")), e,
           options(merge(section.path("options"), c.get("options"))));
       assertEquals(c.path("ok").asBoolean(), result.ok(), c.path("name").asText() + ": " + result.reason());

@@ -2,6 +2,8 @@ package com.intyga.verify;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.interfaces.ECPublicKey;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -18,6 +20,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.Map;
 import java.util.LinkedHashMap;
+import java.util.Locale;
 
 /**
  * Offline verification of DIV approval receipts: recompute the canonical payload from the caller's
@@ -81,6 +84,18 @@ public final class Verify {
     return null;
   }
 
+  private static String tenantProblem(Integer version, String signedTenant, String expectedTenant) {
+    if (version != null && version == Div.VERSION)
+      return expectedTenant == null ? null : "legacy v1 receipt cannot satisfy an expected tenant";
+    if (version != null && version == Div.TENANT_VERSION) {
+      if (isEmpty(signedTenant)) return "v2 receipt is missing a non-empty tenantId";
+      if (isEmpty(expectedTenant)) return "v2 receipt requires a caller-supplied non-empty tenantId";
+      if (!signedTenant.equals(expectedTenant)) return "receipt is for a different tenant";
+      return null;
+    }
+    return "unsupported DIV payload version";
+  }
+
   /** Byte-identical DIV §5c canonical platform intent. */
   public static String canonicalPlatformIntentPayload(
       String payloadHash, String rpId, String subjectExternalId,
@@ -93,6 +108,13 @@ public final class Verify {
     return Canonical.stableStringify(m);
   }
 
+  public static String canonicalPlatformIntentPayloadWithTenant(
+      String payloadHash, String rpId, String subjectExternalId, String signedAt,
+      String expiresAt, String nonce, String tenantId) {
+    return Canonical.withTenant(canonicalPlatformIntentPayload(payloadHash, rpId,
+        subjectExternalId, signedAt, expiresAt, nonce), tenantId);
+  }
+
   /** Byte-identical DIV §5b canonical authority statement. Set-valued fields are sorted. */
   public static String canonicalAgentAuthorityPayload(
       String target, List<String> actionPatterns, String display, String agentDid,
@@ -100,6 +122,15 @@ public final class Verify {
       String nonce, String sealedAt, String expiresAt) {
     return canonicalAgentAuthorityPayload(target, actionPatterns, display, agentDid, requester,
         requirement, nonce, sealedAt, expiresAt, null);
+  }
+
+  public static String canonicalAgentAuthorityPayloadWithTenant(
+      String target, List<String> actionPatterns, String display, String agentDid,
+      RequesterIdentity requester, ApprovalRequirement requirement,
+      String nonce, String sealedAt, String expiresAt, String parentReceiptHash,
+      String tenantId) {
+    return Canonical.withTenant(canonicalAgentAuthorityPayload(target, actionPatterns, display,
+        agentDid, requester, requirement, nonce, sealedAt, expiresAt, parentReceiptHash), tenantId);
   }
 
   public static String canonicalAgentAuthorityPayload(
@@ -140,7 +171,10 @@ public final class Verify {
     com.fasterxml.jackson.databind.JsonNode p;
     try { p = Records.JSON.readTree(receipt.canonicalPayload()); }
     catch (Exception e) { return PlatformVerification.refuse("canonicalPayload is not valid JSON"); }
-    if (p.path("v").asInt(-1) != Div.VERSION) return PlatformVerification.refuse("unsupported DIV payload version");
+    String tenantProblem = tenantProblem(p.path("v").isInt() ? p.path("v").asInt() : null,
+        p.path("tenantId").isTextual() ? p.path("tenantId").asText() : null,
+        expected == null ? null : expected.tenantId());
+    if (tenantProblem != null) return PlatformVerification.refuse(tenantProblem);
     String type = p.path("type").asText("");
     if (!Div.PLATFORM_INTENT_TYPE.equals(type)) {
       return PlatformVerification.refuse(Div.INTENT_TYPE.equals(type) || Div.OFFLINE_INTENT_TYPE.equals(type)
@@ -162,7 +196,7 @@ public final class Verify {
     if (isEmpty(subject)) return PlatformVerification.refuse("receipt missing subject.externalId");
     if (expected.subjectExternalId() != null && !expected.subjectExternalId().equals(subject))
       return PlatformVerification.refuse("receipt was signed by a different subject");
-    String canonical = canonicalPlatformIntentPayload(expected.payloadHash(), expected.rpId(), subject, signedAt, expiresAt, expected.nonce());
+    String canonical = Canonical.withTenant(canonicalPlatformIntentPayload(expected.payloadHash(), expected.rpId(), subject, signedAt, expiresAt, expected.nonce()), expected.tenantId());
     if (!canonical.equals(receipt.canonicalPayload())) return PlatformVerification.refuse("payloadHash/rpId do not match what was signed");
     Instant signed; Instant expiry;
     try { signed = SignedTime.parse(signedAt).toInstant(); } catch (Exception e) { return PlatformVerification.refuse("signedAt is not a valid RFC3339 timestamp"); }
@@ -220,7 +254,10 @@ public final class Verify {
     com.fasterxml.jackson.databind.JsonNode p;
     try { p = Records.JSON.readTree(receipt.canonicalPayload()); }
     catch (Exception e) { return AgentAuthorityVerification.refuse("canonicalPayload is not valid JSON"); }
-    if (p.path("v").asInt(-1) != Div.VERSION) return AgentAuthorityVerification.refuse("unsupported DIV payload version");
+    String tenantProblem = tenantProblem(p.path("v").isInt() ? p.path("v").asInt() : null,
+        p.path("tenantId").isTextual() ? p.path("tenantId").asText() : null,
+        expected == null ? null : expected.tenantId());
+    if (tenantProblem != null) return AgentAuthorityVerification.refuse(tenantProblem);
     if (!Div.AGENT_AUTHORITY_TYPE.equals(p.path("type").asText())) return AgentAuthorityVerification.refuse("payload is not a div-agent-authority");
     List<String> patterns = new ArrayList<>();
     if (!p.path("actionPatterns").isArray()) return AgentAuthorityVerification.refuse("authority is missing a valid actionPatterns set");
@@ -252,7 +289,7 @@ public final class Verify {
     if (floorProblem != null) return AgentAuthorityVerification.refuse(floorProblem);
     if (expected == null || isEmpty(expected.target()) || isEmpty(expected.agentDid()) || expected.approvers() == null)
       return AgentAuthorityVerification.refuse("expected target, agentDid and approvers are required");
-    String rebuilt = canonicalAgentAuthorityPayload(expected.target(), patterns, receipt.actionDescription(), expected.agentDid(), receipt.requester(), requirement, nonce, sealedAt, expiresAt, parentReceiptHash);
+    String rebuilt = Canonical.withTenant(canonicalAgentAuthorityPayload(expected.target(), patterns, receipt.actionDescription(), expected.agentDid(), receipt.requester(), requirement, nonce, sealedAt, expiresAt, parentReceiptHash), expected.tenantId());
     if (!rebuilt.equals(receipt.canonicalPayload())) return AgentAuthorityVerification.refuse("target/agent/actionPatterns do not match what was sealed");
     if ("AUTO_APPROVED".equals(receipt.sigAlg())) return AgentAuthorityVerification.refuse("an agent authority cannot be auto-approved");
     List<ApprovalWitness> ws = witnessesOf(receipt); if (ws.isEmpty()) return AgentAuthorityVerification.refuse("authority missing signature material");
@@ -278,22 +315,118 @@ public final class Verify {
     if (verified.size() < requirement.requiredApprovals()) return AgentAuthorityVerification.refuse("authority quorum not met: " + verified.size() + " of " + requirement.requiredApprovals() + foldFailures(failures));
     List<String> signers = new ArrayList<>(verified); Collections.sort(signers);
     List<String> scope = new ArrayList<>(new LinkedHashSet<>(patterns)); Collections.sort(scope);
-    return new AgentAuthorityVerification(true, null, new VerifiedAgentAuthority(expected.agentDid(), expected.target(), scope, nonce, signers, sealedAt, expiresAt, parentReceiptHash));
+    return new AgentAuthorityVerification(true, null, new VerifiedAgentAuthority(expected.agentDid(), expected.target(), scope, nonce, signers, sealedAt, expiresAt, parentReceiptHash, expected.tenantId()));
   }
 
-  /**
-   * One key, one person (DIV §4.4.6). An identity-associating anchor that maps the SAME key to two
-   * DIDs would otherwise let that key's holder count as two approvers, since quorum counts distinct
-   * identities. A key already counted for one identity cannot count for another. Keys compare by
-   * decoded bytes (padding and base64/base64url spellings of one encoding match; the same key in
-   * another encoding, COSE vs SPKI, is not detected). Records the key when it is free.
-   */
+  /** Commits to an authority receipt and all its witnesses in canonical order. */
+  public static String agentReceiptDigest(ApprovalReceipt receipt) {
+    if (receipt.signatures() != null && !receipt.signatures().isEmpty()) {
+      for (ApprovalWitness witness : receipt.signatures()) {
+        if (witness == null || witness.signature() == null) {
+          throw new IllegalArgumentException("authority receipt contains an incomplete witness");
+        }
+      }
+    }
+    List<Map<String, Object>> witnesses = new ArrayList<>();
+    boolean legacyWitness = receipt.signatures() == null || receipt.signatures().isEmpty();
+    for (ApprovalWitness w : witnessesOf(receipt)) {
+      Map<String, Object> projected = new LinkedHashMap<>();
+      projected.put("signerDid", legacyWitness && w.signerDid() == null ? "" : w.signerDid());
+      projected.put("signerPublicKey", w.signerPublicKey());
+      projected.put("signature", w.signature());
+      projected.put("sigAlg", w.sigAlg());
+      projected.put("authenticatorData", w.authenticatorData());
+      projected.put("clientDataJSON", w.clientDataJSON());
+      witnesses.add(projected);
+    }
+    witnesses.sort((a, b) -> Canonical.stableStringify(a).compareTo(Canonical.stableStringify(b)));
+    String content = Canonical.stableStringify(Map.of(
+        "canonicalPayload", receipt.canonicalPayload(), "witnesses", witnesses));
+    try {
+      MessageDigest digest = MessageDigest.getInstance("SHA-256");
+      digest.update("intyga-agent-receipt-v1\0".getBytes(StandardCharsets.UTF_8));
+      return "sha256:" + java.util.HexFormat.of().formatHex(digest.digest(content.getBytes(StandardCharsets.UTF_8)));
+    } catch (java.security.NoSuchAlgorithmException e) {
+      throw new IllegalStateException("SHA-256 is unavailable", e);
+    }
+  }
+
+  /** Verifies a complete root-to-leaf human-sealed authority chain for a delegated agent action. */
+  public static VerifyResult verifyAgentDelegationChain(
+      List<AgentAuthorityChainLink> chain, AgentDelegatedAction action, VerifyOptions opts) {
+    if (chain == null || chain.size() < 2 || action == null || !agentDigest(action.delegatedBy()))
+      return VerifyResult.refuse("delegation requires a complete root-to-leaf authority chain");
+    VerifiedAgentAuthority parent = null;
+    String parentHash = null;
+    for (int i = 0; i < chain.size(); i++) {
+      AgentAuthorityChainLink link = chain.get(i);
+      if (link == null || link.receipt() == null || link.expected() == null)
+        return VerifyResult.refuse("authority chain has a missing link");
+      AgentAuthorityVerification proof = verifyAgentAuthority(link.receipt(), link.expected(), opts);
+      if (!proof.ok() || proof.authority() == null)
+        return VerifyResult.refuse("authority link " + (i + 1) + ": " + proof.reason());
+      VerifiedAgentAuthority authority = proof.authority();
+      if (!Objects.equals(authority.tenantId(), action.tenantId()))
+        return VerifyResult.refuse("authority chain and action belong to different tenants");
+      if (!Objects.equals(authority.target(), action.target()))
+        return VerifyResult.refuse("delegated authority changes target");
+      if (!Objects.equals(authority.parentReceiptHash(), parentHash))
+        return VerifyResult.refuse("delegated authority has a missing or different parent receipt");
+      if (parent != null) {
+        if (!Objects.equals(authority.tenantId(), parent.tenantId()))
+          return VerifyResult.refuse("authority chain crosses tenant boundaries");
+        try {
+          Instant childSealed = SignedTime.parse(authority.sealedAt()).toInstant();
+          Instant parentSealed = SignedTime.parse(parent.sealedAt()).toInstant();
+          Instant childExpires = SignedTime.parse(authority.expiresAt()).toInstant();
+          Instant parentExpires = SignedTime.parse(parent.expiresAt()).toInstant();
+          if (childSealed.isBefore(parentSealed) || childExpires.isAfter(parentExpires))
+            return VerifyResult.refuse("child authority outlives or predates its parent");
+        } catch (RuntimeException e) {
+          return VerifyResult.refuse("authority chain has an invalid validity window");
+        }
+        for (String child : authority.actionPatterns()) {
+          boolean covered = parent.actionPatterns().stream().anyMatch(scope -> scope.equals("*")
+              || child.toLowerCase(Locale.ROOT).contains(scope.toLowerCase(Locale.ROOT)));
+          if (!covered) return VerifyResult.refuse("child authority escalates the parent's action scope");
+        }
+      }
+      try {
+        parentHash = agentReceiptDigest(link.receipt());
+      } catch (RuntimeException e) {
+        return VerifyResult.refuse("authority link " + (i + 1) + " cannot be digested");
+      }
+      parent = authority;
+    }
+    if (parent == null || !Objects.equals(parentHash, action.delegatedBy())
+        || !Objects.equals(parent.agentDid(), action.agentDid()))
+      return VerifyResult.refuse("action does not name its delegated agent and leaf authority receipt");
+    boolean covered = parent.actionPatterns().stream().anyMatch(pattern -> pattern.equals("*")
+        || action.actionType().toLowerCase(Locale.ROOT).contains(pattern.toLowerCase(Locale.ROOT)));
+    return covered ? VerifyResult.accept(List.of())
+        : VerifyResult.refuse("action falls outside the delegated authority");
+  }
+
+  /** One P-256 key maps to one identity even when serialized as COSE for one DID and SPKI for another. */
   static String sharedKeyProblem(Map<String, String> counted, String key, String identity) {
     String fingerprint = key;
     try {
       String std = key.replace('-', '+').replace('_', '/').replace("=", "");
-      fingerprint = java.util.HexFormat.of().formatHex(Base64.getDecoder().decode(
-          std + "===".substring(0, (4 - std.length() % 4) % 4)));
+      byte[] decoded = Base64.getDecoder().decode(
+          std + "===".substring(0, (4 - std.length() % 4) % 4));
+      fingerprint = java.util.HexFormat.of().formatHex(decoded);
+      ECPublicKey point = null;
+      try {
+        point = decoded.length > 0 && decoded[0] == 0x30
+            ? Ecdsa.parseSpkiP256(decoded)
+            : WebAuthnSupport.parseCoseP256Key(decoded);
+      } catch (Ecdsa.Refusal ignored) {
+        // Unsupported and malformed keys retain their decoded-byte fingerprint.
+      }
+      if (point != null) {
+        fingerprint = String.format(Locale.ROOT, "p256:%064x:%064x",
+            point.getW().getAffineX(), point.getW().getAffineY());
+      }
     } catch (IllegalArgumentException e) {
       // not base64: compare the text itself
     }
@@ -316,6 +449,7 @@ public final class Verify {
       com.fasterxml.jackson.databind.JsonNode agent,
       String challengedAt,
       String sealedAt,
+      String tenantId,
       List<String> delegatedTo,
       Integer delegatedQuorum,
       ApprovalRequirement requirement) {}
@@ -336,9 +470,8 @@ public final class Verify {
     } catch (Exception e) {
       return VerifyResult.refuse("canonicalPayload is not valid JSON");
     }
-    if (fields.v() == null || fields.v() != Div.VERSION) {
-      return VerifyResult.refuse("unsupported DIV payload version");
-    }
+    String tenantIssue = tenantProblem(fields.v(), fields.tenantId(), expected == null ? null : expected.tenantId());
+    if (tenantIssue != null) return VerifyResult.refuse(tenantIssue);
     // A DELEGATION authorizes nothing (DIV §5a.5). Refused here unconditionally — there is
     // deliberately NO option that would let one through, because a delegation that could authorize
     // its own action would be exactly the pre-signed bearer capability the design exists to avoid.
@@ -380,6 +513,10 @@ public final class Verify {
     if (receipt.requester() == null) {
       return VerifyResult.refuse("receipt missing requester");
     }
+    if (expected != null && expected.requesterDid() != null
+        && !Objects.equals(receipt.requester().did(), expected.requesterDid())) {
+      return VerifyResult.refuse("approval was requested by a different principal");
+    }
     boolean agentIntent = fields.agent() != null;
     if (agentIntent != (expected.agentContext() != null))
       return VerifyResult.refuse("agent receipt requires independently asserted PEP context");
@@ -391,8 +528,21 @@ public final class Verify {
       String contextProblem = validateAgentContext(expected.agentContext(), expiresAt, receipt.sigAlg());
       if (contextProblem != null) return VerifyResult.refuse("invalid independently asserted agent context: " + contextProblem);
       Object nestedAgent = expected.agentContext().get("agent");
-      if (nestedAgent instanceof Map<?, ?> agentMap && agentMap.get("delegatedBy") != null)
-        return VerifyResult.refuse("delegated agent receipt requires a trusted root-to-leaf authority chain");
+      if (nestedAgent instanceof Map<?, ?> agentMap && agentMap.get("delegatedBy") != null) {
+        if (opts.agentAuthorityChain().isEmpty())
+          return VerifyResult.refuse("delegated agent receipt requires a trusted root-to-leaf authority chain");
+        String requesterDid = expected == null ? null : expected.requesterDid();
+        if (isEmpty(requesterDid))
+          return VerifyResult.refuse("delegated agent receipt requires an independently asserted requester DID");
+        VerifyResult chain = verifyAgentDelegationChain(
+            opts.agentAuthorityChain(), new AgentDelegatedAction(
+                expected == null ? null : expected.tenantId(),
+                expected == null ? null : expected.target(),
+                expected == null ? null : expected.actionType(),
+                requesterDid,
+                Objects.toString(agentMap.get("delegatedBy"), "")), opts);
+        if (!chain.ok()) return chain;
+      }
       try {
         Object rawNbf = expected.agentContext().get("nbf");
         if (!(rawNbf instanceof String nbf)) return VerifyResult.refuse("invalid agent nbf");
@@ -514,6 +664,10 @@ public final class Verify {
       if (!Objects.equals(nz(d.target()), nz(expected.target()))) {
         return VerifyResult.refuse("the delegation was issued for a different target");
       }
+      if (!Objects.equals(d.tenantId(), expected.tenantId()))
+        return VerifyResult.refuse("the delegation is bound to a different tenant");
+      if (!Objects.equals(receipt.requester().did(), d.requesterDid()))
+        return VerifyResult.refuse("offline approval was requested by a different principal than the delegation");
       if (!Objects.equals(nz(d.actionType()), nz(expected.actionType()))) {
         return VerifyResult.refuse("the delegation was issued for a different actionType");
       }
@@ -544,7 +698,7 @@ public final class Verify {
     String recomputed;
     try {
       if (offline) {
-        recomputed = Canonical.canonicalOfflineIntentPayload(
+        recomputed = Canonical.canonicalOfflineIntentPayloadWithTenant(
             expected.target(),
             expected.actionType(),
             receipt.actionDescription(),
@@ -553,9 +707,9 @@ public final class Verify {
             fields.requirement(),
             fields.nonce(),
             fields.challengedAt(),
-            expiresAt);
+            expiresAt, expected.tenantId());
       } else {
-        recomputed = Canonical.canonicalIntentPayload(
+        recomputed = Canonical.withTenant(Canonical.canonicalIntentPayload(
             expected.target(),
             expected.actionType(),
             receipt.actionDescription(),
@@ -564,7 +718,7 @@ public final class Verify {
             fields.requirement(),
             fields.nonce(),
             expiresAt,
-            agentIntent ? expected.agentContext() : null);
+            agentIntent ? expected.agentContext() : null), expected.tenantId());
       }
     } catch (Canonical.NonPortableValueException e) {
       // Almost always expected.params carrying a non-portable number. Deliberately DISTINCT from
@@ -715,9 +869,8 @@ public final class Verify {
     } catch (Exception e) {
       return refuseDelegation("canonicalPayload is not valid JSON");
     }
-    if (fields.v() == null || fields.v() != Div.VERSION) {
-      return refuseDelegation("unsupported DIV payload version");
-    }
+    String tenantIssue = tenantProblem(fields.v(), fields.tenantId(), expected == null ? null : expected.tenantId());
+    if (tenantIssue != null) return refuseDelegation(tenantIssue);
     if (!Div.DELEGATION_TYPE.equals(fields.type())) {
       return refuseDelegation("payload is not a div-delegation");
     }
@@ -789,6 +942,10 @@ public final class Verify {
     if (receipt.requester() == null) {
       return refuseDelegation("delegation missing requester");
     }
+    if (expected.requesterDid() != null
+        && !Objects.equals(receipt.requester().did(), expected.requesterDid())) {
+      return refuseDelegation("approval was requested by a different principal");
+    }
     if (fields.requirement() == null) {
       return refuseDelegation("delegation payload is missing the signed approval requirement");
     }
@@ -812,7 +969,7 @@ public final class Verify {
 
     String recomputed;
     try {
-      recomputed = Canonical.canonicalDelegationPayload(
+      recomputed = Canonical.canonicalDelegationPayloadWithTenant(
           expected.target(),
           expected.actionType(),
           receipt.actionDescription(),
@@ -823,7 +980,7 @@ public final class Verify {
           fields.delegatedQuorum(),
           fields.nonce(),
           fields.sealedAt(),
-          fields.expiresAt());
+          fields.expiresAt(), expected.tenantId());
     } catch (Canonical.NonPortableValueException e) {
       return refuseDelegation("expected.Params is not canonicalizable: " + e.getMessage());
     }
@@ -918,7 +1075,9 @@ public final class Verify {
             expected.params(),
             fields.nonce(),
             signers,
-            fields.expiresAt()));
+            fields.expiresAt(),
+            expected.tenantId(),
+            receipt.requester().did()));
   }
 
   /**
@@ -1030,7 +1189,7 @@ public final class Verify {
       return List.of();
     }
     return List.of(new ApprovalWitness(
-        receipt.signerDid() == null ? "" : receipt.signerDid(),
+        receipt.signerDid(),
         receipt.signerPublicKey(),
         receipt.signature(),
         receipt.sigAlg(),

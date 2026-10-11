@@ -20,4 +20,5 @@ public record DecodedChallenge(
     ApprovalRequirement requirement,
     String nonce,
     String challengedAt,
-    String expiresAt) {}
+    String expiresAt,
+    String tenantId) {}

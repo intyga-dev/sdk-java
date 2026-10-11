@@ -6,4 +6,10 @@ public record PlatformExpected(
     String payloadHash,
     String rpId,
     String nonce,
-    String subjectExternalId) {}
+    String subjectExternalId,
+    String tenantId) {
+  public PlatformExpected(ApproverTrustAnchor approvers, String payloadHash, String rpId,
+      String nonce, String subjectExternalId) {
+    this(approvers, payloadHash, rpId, nonce, subjectExternalId, null);
+  }
+}

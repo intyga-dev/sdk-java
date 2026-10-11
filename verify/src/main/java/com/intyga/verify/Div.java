@@ -3,6 +3,8 @@ package com.intyga.verify;
 /** DIV protocol constants (docs/DIV.md v1). */
 public final class Div {
   public static final int VERSION = 1;
+  /** Tenant-bound version; v1 canonical bytes remain unchanged for legacy callers. */
+  public static final int TENANT_VERSION = 2;
   public static final String INTENT_TYPE = "div-intent-verification";
 
   /**

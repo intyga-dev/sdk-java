@@ -11,4 +11,12 @@ public record VerifiedAgentAuthority(
     List<String> signers,
     String sealedAt,
     String expiresAt,
-    String parentReceiptHash) {}
+    String parentReceiptHash,
+    String tenantId) {
+  public VerifiedAgentAuthority(String agentDid, String target, List<String> actionPatterns,
+      String nonce, List<String> signers, String sealedAt, String expiresAt,
+      String parentReceiptHash) {
+    this(agentDid, target, actionPatterns, nonce, signers, sealedAt, expiresAt,
+        parentReceiptHash, null);
+  }
+}

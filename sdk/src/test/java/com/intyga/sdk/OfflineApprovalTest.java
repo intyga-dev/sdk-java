@@ -15,6 +15,8 @@ import com.intyga.sdk.offline.ApprovalPolicyConflict;
 import com.intyga.sdk.offline.BundlePolicy;
 import com.intyga.sdk.offline.ChallengeRequest;
 import com.intyga.sdk.offline.ChallengeResult;
+import com.intyga.sdk.offline.DecodedChallenge;
+import com.intyga.sdk.offline.DecodedChallengeResult;
 import com.intyga.sdk.offline.FileRedemptionStore;
 import com.intyga.sdk.offline.OfflineAction;
 import com.intyga.sdk.offline.OfflineApproval;
@@ -230,7 +232,8 @@ class OfflineApprovalTest {
     TrustBundle bundle = TrustBundle.load(dir, AS_OF).bundle();
     var check = Verify.verifyApprovalReceipt(stored,
         new Expected(TARGET, r.nonce(), "db.restart", PARAMS,
-            bundle.approverAnchor(List.of("did:intyga:alice", "did:intyga:bob"), AnchorPurpose.OFFLINE_INTENT)),
+            bundle.approverAnchor(List.of("did:intyga:alice", "did:intyga:bob"), AnchorPurpose.OFFLINE_INTENT))
+            .withTenantId(bundle.tenantId()),
         VerifyOptions.builder().allowOffline(true).asOf(AS_OF).build());
     assertTrue(check.ok(), check.reason());
 
@@ -332,6 +335,24 @@ class OfflineApprovalTest {
       assertEquals(64, Base64.getDecoder().decode(w.signature()).length, "IEEE P1363 r||s");
       assertTrue(OfflineApprovalVectorsTest.verifyWithSpki(expectedKey, r.challenge().canonicalPayload(), w.signature()));
     }
+  }
+
+  @Test
+  void legacyOfflineChallengeCanBeDecodedButCannotReceiveANewSignature() throws Exception {
+    String v2Envelope = validChallengeEnvelope();
+    DecodedChallenge challenge = OfflineApproval.decodeChallengeEnvelope(v2Envelope).challenge();
+    String legacyPayload = Canonical.canonicalOfflineIntentPayload(challenge.target(),
+        challenge.actionType(), challenge.display(), challenge.params(), challenge.requester(),
+        challenge.requirement(), challenge.nonce(), challenge.challengedAt(), challenge.expiresAt());
+    String legacyEnvelope = "DIV1:" + Base64.getUrlEncoder().withoutPadding()
+        .encodeToString(legacyPayload.getBytes(StandardCharsets.UTF_8));
+
+    DecodedChallengeResult decoded = OfflineApproval.decodeChallengeEnvelope(legacyEnvelope);
+    assertTrue(decoded.ok(), decoded.reason());
+    SignResult result = OfflineApproval.signChallengeEnvelope(
+        legacyEnvelope, aliceOffline(), "did:intyga:alice", AS_OF);
+    assertFalse(result.ok());
+    assertTrue(result.reason().contains("legacy v1 offline challenges"), result.reason());
   }
 
   @Test
