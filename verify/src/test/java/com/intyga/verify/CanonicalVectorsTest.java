@@ -154,6 +154,11 @@ class CanonicalVectorsTest {
           entry.get("expectOk").asBoolean(),
           result.ok(),
           "vector " + entry.get("name").asText() + " (reason=" + result.reason() + ")");
+      // A DEWP §4.7 statement must be refused for being one, not merely for failing a later step.
+      if ("execution-evidence-refused-by-approval-verifier".equals(entry.get("name").asText())) {
+        assertTrue(result.reason() != null && result.reason().contains("execution-evidence statement"),
+            "statement refused for the wrong reason (reason=" + result.reason() + ")");
+      }
       // Pinning the REASON, not just the refusal: `0 >= 0` makes DIV §5 step 7 true with nothing
       // counted, so this receipt can be refused for the right rule or for none at all.
       if ("zero-required-approvals-refused".equals(entry.get("name").asText())) {

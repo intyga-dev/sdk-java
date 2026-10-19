@@ -481,6 +481,12 @@ public final class Verify {
               + " VerifyDelegation and pass the result as opts.Delegation, together with an offline"
               + " approval signed by the delegated operators");
     }
+    // A DEWP execution-evidence statement (DEWP §4.7) is a source's observation AFTER execution, not
+    // an approval. Refused with its own reason, like the other non-approval kinds.
+    if (ExecutionEvidence.TYPE.equals(fields.type())) {
+      return VerifyResult.refuse("this is a DEWP execution-evidence statement, which approves nothing — evaluate it"
+          + " with ExecutionEvidence.evaluate over an evidence bundle");
+    }
     boolean offline = Div.OFFLINE_INTENT_TYPE.equals(fields.type());
     if (!offline && !Div.INTENT_TYPE.equals(fields.type())) {
       return VerifyResult.refuse("payload is not a div-intent-verification");

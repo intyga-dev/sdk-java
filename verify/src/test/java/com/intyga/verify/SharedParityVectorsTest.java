@@ -298,4 +298,107 @@ final class SharedParityVectorsTest {
       assertEquals(item.path("expected").asText(), Verify.canonicalPlatformIntentPayload(i.path("payloadHash").asText(), i.path("rpId").asText(), i.path("subjectExternalId").asText(), i.path("signedAt").asText(), i.path("expiresAt").asText(), i.path("nonce").asText()));
     }
   }
+
+  /** DEWP §4.7 (version 1.1): the shared executionEvidence section, run exactly as TS runs it. */
+  @Test
+  void executionEvidenceVectors() {
+    JsonNode section = load().path("executionEvidence");
+    assertTrue(section.path("cases").size() > 0 && section.path("proofs").size() > 0);
+    var mapType = new com.fasterxml.jackson.core.type.TypeReference<Map<String, List<String>>>() {};
+    // Evidence-source keys are bare SPKI strings or {key, notBefore?, notAfter?} objects (DEWP §4.7.5).
+    var policyType = new com.fasterxml.jackson.core.type.TypeReference<Map<String, List<Object>>>() {};
+    for (JsonNode c : section.path("cases")) {
+      String name = c.path("name").asText();
+      JsonNode o = c.path("options");
+      Set<String> roots = new java.util.HashSet<>();
+      o.path("trustedRoots").forEach(r -> roots.add(r.asText()));
+      ExecutionEvidence.Policy evidence = o.has("evidencePolicy")
+          ? new ExecutionEvidence.Policy(Records.JSON.convertValue(o.path("evidencePolicy").path("trustedSources"), policyType)) : null;
+      AuditSignatures.Policy signatures = o.has("signaturePolicy")
+          ? new AuditSignatures.Policy(Records.JSON.convertValue(o.path("signaturePolicy").path("trustedSigners"), mapType), null, null) : null;
+      // The anchored-time cases (DEWP §4.7.5) carry a Rekor-witnessed anchor in the bundle's checkpoint
+      // and pin the log key inline: the case `policy` is the anchor policy, `rekorSpki` the Rekor key.
+      Ledger.AnchorPolicy anchorPolicy = null;
+      if (c.has("policy")) {
+        List<String> issuers = new ArrayList<>();
+        c.path("policy").path("trustedIssuers").forEach(i -> issuers.add(i.asText()));
+        anchorPolicy = new Ledger.AnchorPolicy(c.path("policy").path("requiredAnchors").asInt(), issuers,
+            c.path("policy").path("quorum").asText());
+      }
+      String rekorKey = o.has("rekorSpki") ? o.path("rekorSpki").asText() : null;
+      var opts = new Dewp.EvidenceOptions(roots, null, anchorPolicy, null, rekorKey, null, null, null, null, null, signatures, false,
+          evidence, o.path("requireExecutionConfirmed").asBoolean(false), Ledger.parseAnchorTimestampMs(o.path("now").asText()),
+          o.has("skewSeconds") ? o.path("skewSeconds").asLong() : null,
+          o.has("maxWindowSeconds") ? o.path("maxWindowSeconds").asLong() : null);
+      var r = Dewp.verifyEvidenceBundle(Dewp.EvidenceBundle.parse(c.path("bundle")), opts);
+      assertEquals(c.path("ok").asBoolean(), r.ok(), name + " " + r.failed());
+      Map<String, String> byNonce = new HashMap<>();
+      r.execution().byNonce().forEach((n, v) -> byNonce.put(n, v.status()));
+      Map<String, String> wantByNonce = new HashMap<>();
+      c.path("execution").path("byNonce").fields().forEachRemaining(f -> wantByNonce.put(f.getKey(), f.getValue().asText()));
+      assertEquals(wantByNonce, byNonce, name + " byNonce");
+      List<String> got = new ArrayList<>();
+      r.execution().checks().forEach(k -> got.add(k.seq() + "/" + k.check().status() + "/" + k.check().trusted()));
+      List<String> want = new ArrayList<>();
+      c.path("execution").path("checks").forEach(k -> want.add(k.path("seq").asText() + "/" + k.path("status").asText() + "/" + k.path("trusted").asBoolean()));
+      List<String> reasons = new ArrayList<>();
+      r.execution().checks().forEach(k -> reasons.add(k.check().reason()));
+      assertEquals(want, got, name + " checks " + reasons);
+      // Every §4.7.4 finding the case pins: late and untrusted contradictions, dispatch conflicts, the
+      // window cap per nonce and per-source continuity.
+      JsonNode f = c.path("execution").path("findings");
+      if (f.has("lateContradicted")) assertEquals(strings(f.path("lateContradicted")), r.execution().lateContradicted(), name + " late");
+      if (f.has("untrustedContradicted")) assertEquals(strings(f.path("untrustedContradicted")), r.execution().untrustedContradicted(), name + " untrusted");
+      if (f.has("dispatchConflicts")) assertEquals(strings(f.path("dispatchConflicts")), r.execution().dispatchConflicts(), name + " conflicts");
+      if (f.has("windowCapped")) {
+        Map<String, Boolean> capped = new HashMap<>(), wantCapped = new HashMap<>();
+        r.execution().byNonce().forEach((n, v) -> capped.put(n, v.windowCapped()));
+        f.path("windowCapped").fields().forEachRemaining(x -> wantCapped.put(x.getKey(), x.getValue().asBoolean()));
+        assertEquals(wantCapped, capped, name + " windowCapped");
+      }
+      if (f.has("sources"))
+        assertEquals(Canonical.stableStringify(Records.JSON.convertValue(f.path("sources"), Object.class)),
+            Canonical.stableStringify(Records.JSON.convertValue(r.execution().sources(), Object.class)), name + " sources");
+      if (c.has("signatures")) {
+        List<String> sigs = new ArrayList<>();
+        r.signatures().checks().forEach(k -> sigs.add(k.seq() + "/" + k.status() + "/" + k.trusted()));
+        List<String> wantSigs = new ArrayList<>();
+        c.path("signatures").forEach(k -> wantSigs.add(k.path("seq").asText() + "/" + k.path("status").asText() + "/" + k.path("trusted").asBoolean()));
+        assertEquals(wantSigs, sigs, name + " signatures");
+      }
+    }
+    for (JsonNode c : section.path("proofs")) {
+      String name = c.path("name").asText();
+      JsonNode o = c.path("options");
+      ExecutionEvidence.Policy evidence = o.has("evidencePolicy")
+          ? new ExecutionEvidence.Policy(Records.JSON.convertValue(o.path("evidencePolicy").path("trustedSources"), policyType)) : null;
+      var opts = new Dewp.BundleOptions(o.path("trustedRoot").asText(), null, null, null, null, null, null, null, null, null, false, evidence);
+      var r = Dewp.verifyBundle(Dewp.ProofBundle.parse(c.path("bundle")), opts);
+      assertTrue(r.properties().contentVerified(), name);
+      String got = r.execution() == null ? null : r.execution().status() + "/" + r.execution().trusted();
+      String want = c.path("execution").isNull() ? null : c.path("execution").path("status").asText() + "/" + c.path("execution").path("trusted").asBoolean();
+      assertEquals(want, got, name);
+    }
+    for (JsonNode c : section.path("statements")) {
+      boolean ok;
+      try { ExecutionEvidence.parseStatement(c.path("bytes").asText()); ok = true; }
+      catch (ExecutionEvidence.MalformedStatementException e) { ok = false; }
+      assertEquals(c.path("ok").asBoolean(), ok, "statement " + c.path("name").asText());
+    }
+    for (JsonNode c : section.path("builder")) {
+      JsonNode i = c.path("input");
+      String got = ExecutionEvidence.canonicalStatement(new ExecutionEvidence.Statement(
+          i.path("nonce").asText(), i.path("payloadSha256").asText(),
+          Records.JSON.convertValue(i.path("observation"), new com.fasterxml.jackson.core.type.TypeReference<Map<String, Object>>() {}),
+          i.path("observedAt").asText(), i.path("sampledAt").asText(), i.path("sequence").asLong(),
+          i.path("source").asText(), i.path("verdict").asText()));
+      assertEquals(c.path("bytes").asText(), got, "builder " + c.path("name").asText());
+    }
+  }
+
+  private static List<String> strings(JsonNode array) {
+    List<String> out = new ArrayList<>();
+    array.forEach(x -> out.add(x.asText()));
+    return out;
+  }
 }

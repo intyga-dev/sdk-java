@@ -44,7 +44,13 @@ public final class Dewp {
    */
   public record BundleVerification(boolean ok, String dailyRoot, String rootSource,
       Properties properties, String verificationLevel, Map<String,Check> checks, List<String> notes,
-      Map<String, Long> witnessTimes, AuditSignatures.Check signature) {}
+      Map<String, Long> witnessTimes, AuditSignatures.Check signature, ExecutionEvidence.Check execution) {
+    public BundleVerification(boolean ok, String dailyRoot, String rootSource, Properties properties,
+        String verificationLevel, Map<String,Check> checks, List<String> notes, Map<String, Long> witnessTimes,
+        AuditSignatures.Check signature) {
+      this(ok, dailyRoot, rootSource, properties, verificationLevel, checks, notes, witnessTimes, signature, null);
+    }
+  }
   /**
    * {@code trustedCheckpoint}: the caller's record of the proof's checkpoint (its roots-file line). A
    * single proof carries no checkpoint, so without it no EXTERNAL anchor counts — the §5.3 time bound
@@ -56,7 +62,14 @@ public final class Dewp {
       Ledger.AnchorPolicy anchorPolicy, Function<Ledger.SignedAnchor, PublicKey> resolveAnchorKey,
       String rekorPublicKey, Map<String,Rfc3161.Trust> rfc3161Trust, String rekorIssuer,
       List<String> rekorSubmitterKeys, Ledger.TrustedCheckpoint trustedCheckpoint,
-      AuditSignatures.Policy signaturePolicy, boolean requireSignatures) {
+      AuditSignatures.Policy signaturePolicy, boolean requireSignatures, ExecutionEvidence.Policy evidencePolicy) {
+    public BundleOptions(String trustedRoot, List<Ledger.SignedAnchor> anchors, Ledger.AnchorPolicy anchorPolicy,
+        Function<Ledger.SignedAnchor, PublicKey> resolveAnchorKey, String rekorPublicKey,
+        Map<String,Rfc3161.Trust> rfc3161Trust, String rekorIssuer, List<String> rekorSubmitterKeys,
+        Ledger.TrustedCheckpoint trustedCheckpoint, AuditSignatures.Policy signaturePolicy, boolean requireSignatures) {
+      this(trustedRoot,anchors,anchorPolicy,resolveAnchorKey,rekorPublicKey,rfc3161Trust,rekorIssuer,rekorSubmitterKeys,
+          trustedCheckpoint,signaturePolicy,requireSignatures,null);
+    }
     public BundleOptions(String trustedRoot, List<Ledger.SignedAnchor> anchors, Ledger.AnchorPolicy anchorPolicy,
         Function<Ledger.SignedAnchor, PublicKey> resolveAnchorKey, String rekorPublicKey,
         Map<String,Rfc3161.Trust> rfc3161Trust, String rekorIssuer, List<String> rekorSubmitterKeys,
@@ -126,9 +139,10 @@ public final class Dewp {
         (displayMatches(b.event(), b.event().canonical(), false) && eq(b.proof().seq(), b.event().canonical().seq()));
     boolean commitment = inclusion && rootConsistent;
     boolean content = commitment && leaf && header;
-    var signatureCheck = content ? AuditSignatures.verify(b.event().canonical(), o.signaturePolicy()) : AuditSignatures.unchecked();
-    boolean signature = signatureCheck.status().equals("verified");
     boolean anchorVerified = false; boolean divergence = false; Map<String, Long> witnessTimes = Map.of();
+    // DEWP §4.7.5: the earliest external witness time among the issuers that COUNTED toward quorum
+    // (a SELF anchor has none), or null — the only clock a caller key's validity interval is held to.
+    Long anchoredTimeMs = null;
     boolean externalCheck = o.rekorPublicKey() != null || o.rfc3161Trust() != null && !o.rfc3161Trust().isEmpty();
     if (o.anchorPolicy() != null && (o.resolveAnchorKey() != null || externalCheck) && root != null) {
       List<Ledger.SignedAnchor> candidates = o.anchors() != null ? o.anchors() : merge(b.anchors(), b.anchor());
@@ -140,8 +154,22 @@ public final class Dewp {
           o.anchors() == null ? List.of() : o.anchors(), o.rekorPublicKey(), o.rfc3161Trust(), o.rekorIssuer(),
           o.rekorSubmitterKeys(), expected);
       anchorVerified = commitment && q.ok(); divergence = q.divergence(); witnessTimes = q.witnessTimes();
+      if (anchorVerified) for (String issuer : q.verifiedIssuers()) {
+        Long t = witnessTimes.get(issuer);
+        if (t != null && (anchoredTimeMs == null || t * 1000 < anchoredTimeMs)) anchoredTimeMs = t * 1000;
+      }
       if (q.reason() != null) notes.add(q.reason()); if (q.note() != null) notes.add(q.note());
     } else if (o.anchorPolicy() != null) notes.add("Anchor quorum could not be evaluated: root and caller trust are required.");
+    // DEWP §4.7: the signature and statement checks run once the anchored time is known (§4.7.5) — a
+    // caller key with a validity interval is placed in time by the counted anchors' external witness,
+    // never by the statement's own clock. With no counting anchor (or a divergence) it has none, and
+    // both checks are given the same time so they agree on a bounded key.
+    Long recordTime = anchorVerified ? anchoredTimeMs : null;
+    var signatureCheck = content ? AuditSignatures.verify(b.event().canonical(), o.signaturePolicy(), o.evidencePolicy(), recordTime) : AuditSignatures.unchecked();
+    boolean signature = signatureCheck.status().equals("verified");
+    // DEWP §4.7.3: one proof cannot bind a statement to its dispatch and approval, so at best unbound.
+    var execution = content && ExecutionEvidence.isEvidenceLeaf(b.event().canonical())
+        ? ExecutionEvidence.checkLeaf(b.event().canonical(), o.evidencePolicy(), recordTime) : null;
     Map<String,Check> checks = new LinkedHashMap<>();
     checks.put("inclusion", new Check(inclusion, inclusion ? "Event leaf recomputes to daily root." : "Inclusion proof invalid."));
     checks.put("rootConsistency", new Check(rootConsistent, "Proof checkpoint root must equal verified root."));
@@ -157,7 +185,7 @@ public final class Dewp {
     String level = !kind || divergence || !commitment ? "INVALID" : !content ? "COMMITMENT_VERIFIED"
         : anchorVerified && (signature || signatureCheck.status().equals("not_applicable")) ? "FULLY_VERIFIED"
         : signature ? "SIGNATURE_VERIFIED" : "CONTENT_VERIFIED";
-    return new BundleVerification(ok, root, source, p, level, checks, notes, witnessTimes, signatureCheck);
+    return new BundleVerification(ok, root, source, p, level, checks, notes, witnessTimes, signatureCheck, execution);
   }
 
   // DEWP §7/§12. Revisions 1 and 2 without a protocol is the supported legacy export.
@@ -214,8 +242,18 @@ public final class Dewp {
   public record SignatureSummary(int verified,List<String> invalid,int notCheckable, List<AuditSignatures.Entry> checks) {
     public SignatureSummary(int verified,List<String> invalid,int notCheckable) { this(verified,invalid,notCheckable,List.of()); }
   }
+  /**
+   * {@code execution} is DEWP §4.7 over the content-verified entries: what caller-trusted sources
+   * observed, never physical truth, and it never changes the properties above.
+   */
   public record EvidenceVerification(boolean ok,int total,int contentVerified,int commitmentOnly,
-      List<Failure> failed,List<RootResult> roots,SignatureSummary signatures,List<String> notes) {}
+      List<Failure> failed,List<RootResult> roots,SignatureSummary signatures,List<String> notes,
+      ExecutionEvidence.Verification execution) {
+    public EvidenceVerification(boolean ok,int total,int contentVerified,int commitmentOnly,
+        List<Failure> failed,List<RootResult> roots,SignatureSummary signatures,List<String> notes) {
+      this(ok,total,contentVerified,commitmentOnly,failed,roots,signatures,notes,ExecutionEvidence.Verification.empty());
+    }
+  }
   /**
    * {@code trustedCheckpoints}: checkpoint records YOU hold (chain-verified roots-file lines, DEWP
    * §5.4.1). Their roots are trusted roots; a bundle checkpoint over one must agree with it on every
@@ -225,7 +263,30 @@ public final class Dewp {
       Ledger.AnchorPolicy anchorPolicy, Function<Ledger.SignedAnchor,PublicKey> resolveAnchorKey,
       String rekorPublicKey, List<Ledger.SignedAnchor> flatAnchors, Map<String,Rfc3161.Trust> rfc3161Trust,
       String rekorIssuer, List<String> rekorSubmitterKeys, List<Ledger.TrustedCheckpoint> trustedCheckpoints,
-      AuditSignatures.Policy signaturePolicy, boolean requireSignatures) {
+      AuditSignatures.Policy signaturePolicy, boolean requireSignatures, ExecutionEvidence.Policy evidencePolicy,
+      boolean requireExecutionConfirmed, Long executionNowMs, Long evidenceSkewSeconds, Long maxEvidenceWindowSeconds) {
+    /**
+     * DEWP §4.7 options: evidence-source trust, the confirmed-execution gate, evaluation time and skew,
+     * with the default maximum evidence window ({@link ExecutionEvidence#DEFAULT_MAX_WINDOW_SECONDS}).
+     */
+    public EvidenceOptions(Set<String> trustedRoots, Map<String,List<Ledger.SignedAnchor>> anchors,
+        Ledger.AnchorPolicy anchorPolicy, Function<Ledger.SignedAnchor,PublicKey> resolveAnchorKey,
+        String rekorPublicKey, List<Ledger.SignedAnchor> flatAnchors, Map<String,Rfc3161.Trust> rfc3161Trust,
+        String rekorIssuer, List<String> rekorSubmitterKeys, List<Ledger.TrustedCheckpoint> trustedCheckpoints,
+        AuditSignatures.Policy signaturePolicy, boolean requireSignatures, ExecutionEvidence.Policy evidencePolicy,
+        boolean requireExecutionConfirmed, Long executionNowMs, Long evidenceSkewSeconds) {
+      this(trustedRoots,anchors,anchorPolicy,resolveAnchorKey,rekorPublicKey,flatAnchors,rfc3161Trust,rekorIssuer,
+          rekorSubmitterKeys,trustedCheckpoints,signaturePolicy,requireSignatures,evidencePolicy,
+          requireExecutionConfirmed,executionNowMs,evidenceSkewSeconds,null);
+    }
+    public EvidenceOptions(Set<String> trustedRoots, Map<String,List<Ledger.SignedAnchor>> anchors,
+        Ledger.AnchorPolicy anchorPolicy, Function<Ledger.SignedAnchor,PublicKey> resolveAnchorKey,
+        String rekorPublicKey, List<Ledger.SignedAnchor> flatAnchors, Map<String,Rfc3161.Trust> rfc3161Trust,
+        String rekorIssuer, List<String> rekorSubmitterKeys, List<Ledger.TrustedCheckpoint> trustedCheckpoints,
+        AuditSignatures.Policy signaturePolicy, boolean requireSignatures) {
+      this(trustedRoots,anchors,anchorPolicy,resolveAnchorKey,rekorPublicKey,flatAnchors,rfc3161Trust,rekorIssuer,
+          rekorSubmitterKeys,trustedCheckpoints,signaturePolicy,requireSignatures,null,false,null,null);
+    }
     public EvidenceOptions(Set<String> trustedRoots, Map<String,List<Ledger.SignedAnchor>> anchors,
         Ledger.AnchorPolicy anchorPolicy, Function<Ledger.SignedAnchor,PublicKey> resolveAnchorKey,
         String rekorPublicKey, List<Ledger.SignedAnchor> flatAnchors, Map<String,Rfc3161.Trust> rfc3161Trust,
@@ -278,6 +339,11 @@ public final class Dewp {
     return value != null && value.matches("-?[0-9]{1,20}") ? new java.math.BigInteger(value) : null;
   }
 
+  /** A seq as a number, or null when it is not one (which a verified entry's cannot be). */
+  private static java.math.BigInteger seqNumber(String value) {
+    return value != null && value.matches("[0-9]+") ? new java.math.BigInteger(value) : null;
+  }
+
   private static EvidenceVerification verifyEvidenceBundleChecked(EvidenceBundle b, EvidenceOptions o) {
     List<Failure> failures = new ArrayList<>();
     List<String> notes = new ArrayList<>();
@@ -315,14 +381,34 @@ public final class Dewp {
           failures.add(new Failure("-", "checkpoint " + cp.id() + " " + p[0] + " contradicts your trusted checkpoint record for its root"));
       }
     }
+    // One root, one checkpoint. A second entry for a root the bundle already lists — with a wider seq
+    // range, or without the chain fields the first one is held to — would otherwise ride on the first
+    // one's anchor verdict: anchors are checked against the FIRST checkpoint for a root, but a record's
+    // anchored time (DEWP §4.7.5) would be looked up through whichever copy claimed to cover it.
+    // Identical duplicates are tolerated.
+    {
+      Map<String, List<Object>> seen = new HashMap<>();
+      for (Checkpoint cp : b.checkpoints()) {
+        List<Object> shape = Arrays.asList(cp.id(), cp.seqStart(), cp.seqEnd(), cp.entryCount(), cp.anchoredAt(),
+            cp.chainHash(), cp.prevChainHash());
+        List<Object> prior = seen.putIfAbsent(cp.root(), shape);
+        if (prior != null && !prior.equals(shape))
+          failures.add(new Failure("-", "checkpoint " + cp.id() + " lists a root the bundle already states with different fields"));
+      }
+    }
     int content = 0, commitOnly = 0, sigOk = 0, sigNo = 0, redactedCount = 0;
     List<String> sigBad = new ArrayList<>();
     Map<String,AuditSignatures.Check> signatureChecks = new LinkedHashMap<>();
+    // Leaf-bound entries, the only ones §4.7 may read, and each one's own checkpoint root from its
+    // inclusion proof.
+    List<ExecutionEvidence.Leaf> contentLeaves = new ArrayList<>();
+    Map<String, String> entryRootBySeq = new HashMap<>();
+    // Root → the checkpoint that states it (first wins), for the anchors' expected position.
     Map<String, Checkpoint> known = new LinkedHashMap<>();
     Map<String, String> checkpointKeys = new HashMap<>();
     Map<String, List<Ledger.SignedAnchor>> bundled = new HashMap<>();
     for (Checkpoint cp : b.checkpoints()) {
-      known.put(cp.root(), cp);
+      known.putIfAbsent(cp.root(), cp);
       if (present(cp.id())) checkpointKeys.put(cp.id(), cp.root());
       if (cp.anchors() != null && !cp.anchors().isEmpty()) bundled.put(cp.root(), cp.anchors());
     }
@@ -400,12 +486,12 @@ public final class Dewp {
         // A bundle naming no tenant has none for a tenant-bound entry to belong to.
         failures.add(new Failure(seq, "entry belongs to another tenant"));
       } else {
+        // §7.1 signatureVerified is checked below, once the anchor quorum has run: the leaf binding
+        // above passed, so the signature is provably the committed one, and an evidence-source key
+        // with a validity interval needs the record's anchored time (DEWP §4.7.5) to be placed in time.
         content++;
-        var signatureCheck=AuditSignatures.verify(e.canonical(),o.signaturePolicy());
-        signatureChecks.put(seq,signatureCheck);
-        if (signatureCheck.status().equals("verified")) sigOk++;
-        else if (signatureCheck.status().equals("invalid")) sigBad.add(seq);
-        else sigNo++;
+        contentLeaves.add(new ExecutionEvidence.Leaf(seq, e.canonical()));
+        entryRootBySeq.put(seq, root);
       }
     }
     // Counters are checked for every entry, independently of inclusion results. An entry WITH a
@@ -493,6 +579,44 @@ public final class Dewp {
     if (!canCheck) notes.add(o.anchorPolicy() == null && o.resolveAnchorKey() == null
         ? "No anchor policy supplied; independent root signatures were not checked."
         : "Anchor policy incomplete; caller trust is required.");
+    // DEWP §4.7.5: a record's anchored time is the earliest external witness time among the anchors
+    // that COUNTED toward quorum for the checkpoint ITS OWN inclusion proof names, and only when its
+    // seq lies within the range those anchors were held to (the caller's record where it states one,
+    // else the bundle's first checkpoint for that root). Only verified issuers counted; a SELF/ES256
+    // anchor has no witness time and contributes nothing. Never another checkpoint's time: a listed
+    // checkpoint claiming a wider range would otherwise backdate every record under it. Used solely to
+    // place a caller key's validity interval in time — never a self-claimed observedAt/sampledAt.
+    Map<String, Long> anchoredRootMs = new HashMap<>();
+    for (RootResult r : roots) {
+      if (!Boolean.TRUE.equals(r.anchorVerified())) continue;
+      Long earliest = null;
+      for (String issuer : r.verifiedIssuers()) {
+        Long t = r.witnessTimes().get(issuer);
+        if (t != null && (earliest == null || t < earliest)) earliest = t;
+      }
+      if (earliest != null) anchoredRootMs.put(r.root(), earliest * 1000);
+    }
+    Function<String, Long> anchoredTime = seq -> {
+      String root = entryRootBySeq.get(seq);
+      Long t = root == null ? null : anchoredRootMs.get(root);
+      if (t == null) return null;
+      Checkpoint cp = known.get(root);
+      var record = records.get(root);
+      java.math.BigInteger s = seqNumber(seq);
+      java.math.BigInteger lo = seqNumber(record != null && record.seqStart() != null ? record.seqStart() : cp.seqStart());
+      java.math.BigInteger hi = seqNumber(record != null && record.seqEnd() != null ? record.seqEnd() : cp.seqEnd());
+      if (s == null || lo == null || hi == null || s.compareTo(lo) < 0 || s.compareTo(hi) > 0) return null;
+      return t;
+    };
+    // §7.1 signatureVerified per content-verified entry, with the anchored time now known, so the
+    // §4.6.1 report and the §4.7.3 statement check agree on a bounded evidence-source key.
+    for (ExecutionEvidence.Leaf leaf : contentLeaves) {
+      var signatureCheck = AuditSignatures.verify(leaf.leaf(), o.signaturePolicy(), o.evidencePolicy(), anchoredTime.apply(leaf.seq()));
+      signatureChecks.put(leaf.seq(), signatureCheck);
+      if (signatureCheck.status().equals("verified")) sigOk++;
+      else if (signatureCheck.status().equals("invalid")) sigBad.add(leaf.seq());
+      else sigNo++;
+    }
     if (!sigBad.isEmpty()) notes.add("Committed signatures do not verify for entries: " + String.join(", ", sigBad));
     List<AuditSignatures.Entry> signatureResults=new ArrayList<>();
     for (var e:b.entries()) {
@@ -500,9 +624,52 @@ public final class Dewp {
       signatureResults.add(new AuditSignatures.Entry(e.event().seq(),check.status(),check.reason(),check.trusted()));
       if (o.requireSignatures() && (!check.status().equals("verified") || !check.trusted())) failures.add(new Failure(e.event().seq(),"Required trusted signature: "+check.reason()));
     }
+    var execution = ExecutionEvidence.evaluate(contentLeaves, new ExecutionEvidence.Options(o.evidencePolicy(),
+        o.executionNowMs(), o.evidenceSkewSeconds(), o.maxEvidenceWindowSeconds(), anchoredTime));
+    if (o.requireExecutionConfirmed()) {
+      if (execution.byNonce().isEmpty()) failures.add(new Failure("-", "Required confirmed execution: the bundle records no execution"));
+      for (var item : execution.byNonce().entrySet()) {
+        var status = item.getValue();
+        if (!status.status().equals("confirmed")) {
+          String at = status.dispatchSeq() != null ? status.dispatchSeq()
+              : !status.evidenceSeqs().isEmpty() ? status.evidenceSeqs().get(0) : "-";
+          failures.add(new Failure(at, "Required confirmed execution: nonce " + item.getKey() + " is " + status.status()));
+        }
+        // §4.7.4: a dispatch conflict means the executing party wrote two accounts of what it sent.
+        if (!status.dispatchConflict().isEmpty())
+          failures.add(new Failure(status.dispatchConflict().get(0), "Required confirmed execution: nonce " + item.getKey()
+              + " has conflicting Dispatch Records (seq " + String.join(", ", status.dispatchConflict()) + ")"));
+        // §4.7.4: a registered source signed a contradiction the status could not count — after the
+        // window the executing party chose, or under a key the bundle cannot place in time. Neither
+        // may clear a policy that requires confirmation.
+        if (!status.lateContradiction().isEmpty())
+          failures.add(new Failure(status.lateContradiction().get(0), "Required confirmed execution: nonce " + item.getKey()
+              + " has a late contradiction (seq " + String.join(", ", status.lateContradiction()) + ")"));
+        if (!status.untrustedContradiction().isEmpty())
+          failures.add(new Failure(status.untrustedContradiction().get(0), "Required confirmed execution: nonce " + item.getKey()
+              + " has a contradiction under a provisioned key that established no trust (seq "
+              + String.join(", ", status.untrustedContradiction()) + ")"));
+      }
+      // §4.7.3 source continuity: a gap or a divergence means the bundle does not carry the whole account.
+      for (var item : execution.sources().entrySet()) {
+        var c = item.getValue();
+        if (!c.gaps().isEmpty()) {
+          List<String> ranges = new ArrayList<>();
+          for (List<Long> g : c.gaps()) ranges.add(g.get(0).equals(g.get(1)) ? String.valueOf(g.get(0)) : g.get(0) + "–" + g.get(1));
+          failures.add(new Failure("-", "Required confirmed execution: source " + item.getKey()
+              + " is missing statement(s) " + String.join(", ", ranges)));
+        }
+        if (!c.divergent().isEmpty()) {
+          List<String> values = new ArrayList<>();
+          for (Long v : c.divergent()) values.add(String.valueOf(v));
+          failures.add(new Failure("-", "Required confirmed execution: source " + item.getKey()
+              + " signed two statements under sequence " + String.join(", ", values)));
+        }
+      }
+    }
     boolean ok = failures.isEmpty() && !b.entries().isEmpty() && trustedRoots != null && allAnchored;
     return new EvidenceVerification(ok, b.entries().size(), content, commitOnly, failures, roots,
-        new SignatureSummary(sigOk, sigBad, sigNo, signatureResults), notes);
+        new SignatureSummary(sigOk, sigBad, sigNo, signatureResults), notes, execution);
   }
   private Dewp() {}
 }

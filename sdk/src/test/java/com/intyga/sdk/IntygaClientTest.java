@@ -478,6 +478,29 @@ class IntygaClientTest {
   }
 
   @Test
+  void executionEvidenceRoutes() {
+    server.createContext(
+        "/authorize/n_1/dispatched",
+        exchange -> {
+          JsonNode body = JSON.readTree(readBody(exchange));
+          expect(body.path("evidenceWithinSeconds").asInt() == 600, "dispatch: window missing");
+          respond(exchange, 200, "{\"ok\":true,\"auditSeq\":\"9\"}");
+        });
+    server.createContext(
+        "/authorize/n_1/evidence",
+        exchange -> {
+          JsonNode body = JSON.readTree(readBody(exchange));
+          expect("{}".equals(body.path("statement").asText()), "evidence: statement missing");
+          expect("c2ln".equals(body.path("signature").asText()), "evidence: signature missing");
+          respond(exchange, 200, "{\"ok\":true,\"counted\":true}");
+        });
+    IntygaClient client = IntygaClient.builder().gatewayUrl(baseUrl()).token("t").build();
+    assertEquals("9", client.reportDispatched("n_1", 600).path("auditSeq").asText());
+    assertTrue(client.submitEvidence("n_1", "{}", "c2ln").path("counted").asBoolean());
+    assertNoViolations();
+  }
+
+  @Test
   void targetIsRequired() {
     // Point at a closed port: validation must reject before any I/O happens.
     IntygaClient client =

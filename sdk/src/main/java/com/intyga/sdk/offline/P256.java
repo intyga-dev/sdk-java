@@ -24,8 +24,13 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import javax.crypto.KeyAgreement;
 
-/** ES256 signing on the JDK's own providers — no crypto dependency. */
-final class P256 {
+/**
+ * ES256 signing on the JDK's own providers — no crypto dependency. The P-256 key loading and
+ * IEEE P1363 signing here serve both the offline-approval ceremony and evidence-source signing
+ * ({@code com.intyga.sdk.EvidenceSource}); the curve check is what keeps every signature one a
+ * verifier will accept.
+ */
+public final class P256 {
 
   static final ECParameterSpec SPEC;
 
@@ -45,7 +50,7 @@ final class P256 {
   private P256() {}
 
   /** A refusal carrying the reason the signing call reports. */
-  static final class KeyRefusal extends Exception {
+  public static final class KeyRefusal extends Exception {
     KeyRefusal(String reason) {
       super(reason);
     }
@@ -65,7 +70,7 @@ final class P256 {
   }
 
   /** Bytes as the reference reads a key file: PEM when it contains a PEM header, else DER PKCS#8. */
-  static PrivateKey parse(byte[] keyBytes) throws KeyRefusal {
+  public static PrivateKey parse(byte[] keyBytes) throws KeyRefusal {
     String asText = new String(keyBytes, StandardCharsets.ISO_8859_1);
     if (asText.contains("-----BEGIN")) {
       return parsePem(asText);
@@ -78,7 +83,7 @@ final class P256 {
    * what {@code openssl ecparam -genkey} writes, after an {@code EC PARAMETERS} block). Encrypted
    * keys of either kind are refused: decrypt them first.
    */
-  static PrivateKey parsePem(String pem) throws KeyRefusal {
+  public static PrivateKey parsePem(String pem) throws KeyRefusal {
     Matcher m = PEM.matcher(pem);
     if (!m.find()) {
       throw new KeyRefusal("no PEM private key block found");
@@ -234,7 +239,7 @@ final class P256 {
   }
 
   /** The key, if it is a P-256 EC private key; otherwise the refusal the reference gives. */
-  static PrivateKey requireP256(PrivateKey key) throws KeyRefusal {
+  public static PrivateKey requireP256(PrivateKey key) throws KeyRefusal {
     if (!(key instanceof ECKey ec) || !"EC".equals(key.getAlgorithm()) || !isP256(ec.getParams())) {
       throw new KeyRefusal("the signing key must be a P-256 (prime256v1) private key");
     }
@@ -242,7 +247,7 @@ final class P256 {
   }
 
   /** ES256 over {@code message}, IEEE P1363 (r||s, 64 bytes) — the form every verifier expects. */
-  static byte[] sign(PrivateKey key, byte[] message) throws GeneralSecurityException {
+  public static byte[] sign(PrivateKey key, byte[] message) throws GeneralSecurityException {
     Signature s = Signature.getInstance("SHA256withECDSAinP1363Format");
     s.initSign(key);
     s.update(message);

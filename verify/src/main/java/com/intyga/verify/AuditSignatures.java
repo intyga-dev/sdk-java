@@ -14,13 +14,29 @@ public final class AuditSignatures {
   static Check unchecked() { return result("not_checked", "Content not verified or unavailable."); }
   private static Check result(String status,String reason) { return new Check(status,reason,false); }
   private static boolean present(String s) { return s!=null && !s.isEmpty(); }
-  public static Check verify(Ledger.AuditLeaf c, Policy p) {
+  public static Check verify(Ledger.AuditLeaf c, Policy p) { return verify(c, p, null); }
+  /** As {@link #verify(Ledger.AuditLeaf, Policy, ExecutionEvidence.Policy, Long)} with no anchored time. */
+  public static Check verify(Ledger.AuditLeaf c, Policy p, ExecutionEvidence.Policy evidence) { return verify(c, p, evidence, null); }
+  /**
+   * An Evidence Record (DEWP §4.7) is checked against evidence-source trust only, and only once the
+   * caller supplies any trust: an approver key never vouches for a statement and a source key never
+   * vouches for an approval (§4.7.5). With no trust at all, §4.6.1's embedded-key check is unchanged.
+   * {@code anchoredTimeMs} is the record's anchored time (§4.7.5), for an evidence-source key that
+   * carries a validity interval: null means no counting anchor covers it, and such a key establishes
+   * nothing — so this report and the §4.7.3 statement check agree on a bounded key.
+   */
+  public static Check verify(Ledger.AuditLeaf c, Policy p, ExecutionEvidence.Policy evidence, Long anchoredTimeMs) {
     if (c==null) return unchecked();
     String alg=c.sigAlg();
     if (!present(alg) && (present(c.signature()) || present(c.signedPayload()) || present(c.signerPublicKey()))) return result("not_checked", "Signature algorithm is missing.");
     if (!present(alg) || alg.equals("AUTO_APPROVED")) return result("not_applicable", "No human signature is declared.");
     if (!alg.equals("ES256") && !alg.equals("WEBAUTHN")) return result("not_checked", "Unsupported signature algorithm.");
     if (!present(c.signature()) || !present(c.signedPayload())) return result("not_checked", "Signature or signed payload is missing.");
+    if ((p!=null || evidence!=null) && ExecutionEvidence.isEvidenceLeaf(c)) {
+      if (!alg.equals("ES256")) return result("not_checked", "Evidence statements are signed with ES256 only.");
+      if (evidence==null) return result("not_checked", "No caller-trusted key for this evidence source.");
+      return ExecutionEvidence.verifySignature(c, evidence, anchoredTimeMs);
+    }
     if (p==null && alg.equals("ES256")) {
       if (!present(c.signerPublicKey())) return result("not_checked", "Signer public key is missing.");
       return Dewp.verifyEmbeddedSignature(c) ? result("verified", "Signature valid under embedded key; signer identity is not established.") : result("invalid", "Signature does not verify.");

@@ -12,6 +12,7 @@ import java.io.IOException;
 import java.net.InetAddress;
 import java.net.URI;
 import java.net.URISyntaxException;
+import com.fasterxml.jackson.databind.JsonNode;
 import java.net.URLEncoder;
 import java.net.UnknownHostException;
 import java.net.http.HttpClient;
@@ -246,6 +247,31 @@ public final class IntygaClient {
   /** Polls a challenge's current state (non-blocking). */
   public ApprovalResult status(String nonce) {
     return doJson("GET", "/authorize/" + pathEscape(nonce), null, ApprovalResult.class, "status");
+  }
+
+  /**
+   * DEWP §4.7: report that the consumed action was sent to its target, and how long an evidence
+   * source has to confirm it. Call after {@link #consume} succeeded. Idempotent for the same window;
+   * never affects the approval. A refusal throws {@link GatewayRefusedException}.
+   */
+  public JsonNode reportDispatched(String nonce, int evidenceWithinSeconds) {
+    Map<String, Object> body = new LinkedHashMap<>();
+    body.put("evidenceWithinSeconds", evidenceWithinSeconds);
+    return doJson(
+        "POST", "/authorize/" + pathEscape(nonce) + "/dispatched", body, JsonNode.class, "reportDispatched");
+  }
+
+  /**
+   * DEWP §4.7: relay a statement an evidence source signed. The gateway accepts it only from a source
+   * the tenant registered; this service relays it and cannot author one. {@code counted} in the
+   * result is false for an observation outside the evidence window.
+   */
+  public JsonNode submitEvidence(String nonce, String statement, String signature) {
+    Map<String, Object> body = new LinkedHashMap<>();
+    body.put("statement", statement);
+    body.put("signature", signature);
+    return doJson(
+        "POST", "/authorize/" + pathEscape(nonce) + "/evidence", body, JsonNode.class, "submitEvidence");
   }
 
   /**

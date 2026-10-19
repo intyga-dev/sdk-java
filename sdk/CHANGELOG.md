@@ -5,6 +5,30 @@ All notable changes to `com.intyga:intyga-sdk` are documented here. The format f
 
 ## [Unreleased]
 
+## [2.1.0]
+
+- `IntygaClient.reportDispatched` / `submitEvidence` (DEWP 1.1 §4.7) and
+  `ApprovalResult.execution` (previous constructors remain).
+- `EvidenceSource.buildExecutionEvidence` / `signExecutionEvidence` — the evidence source's side of
+  DEWP §4.7, as in every other SDK. The statement carries `sampledAt` (when the measurement was
+  taken; defaults to `observedAt`, and the verifier's window is evaluated on it) and the source's
+  own gapless per-log `sequence` (required: it is what lets a verifier see a withheld statement),
+  and is signed ES256 (IEEE P1363) with a P-256 key given as a `PrivateKey`, a PEM (PKCS#8 or SEC1)
+  or key-file bytes; any other key is refused. `com.intyga.sdk.offline.P256` is now public so both
+  signers share one key loader.
+- `EvidenceSourcesFile.parse(text)` / `evidencePolicy()` — the relying party's `intyga-evidence-sources`
+  trust file (docs/API.md §2e) loaded into `verify-java`'s `ExecutionEvidence.Policy`, as in every
+  other SDK. It throws `InvalidEvidenceSourcesException` on the first problem: `v` must be the
+  integer `1`, a key is a base64 SPKI string or an object with exactly `key`, `notBefore` and
+  `notAfter` (a misspelt bound is refused, never read as "no bound"), and every bound is a real
+  DEWP §4.3 instant with `notBefore` not later than `notAfter`. Source and key order are preserved.
+  It passes every `executionEvidence.trustFiles` case of the shared `verifier-parity-vectors.json`
+  on JDK 17 and 21.
+- `ApprovalGuard.wrap` for framework-neutral JSON tool callbacks: detached arguments, caller-trusted
+  receipt verification and checked single-use consumption before execution. Optional DEWP dispatch
+  reporting preserves results and exceptions and provides the nonce for report retries.
+  `tenantId` is the independently trusted tenant DIV v2 receipts require, as in the Python guard.
+
 ## [2.0.0]
 
 - Bind delegation verification to the independently expected requester; a workload cannot reuse

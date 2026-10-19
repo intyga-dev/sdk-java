@@ -5,6 +5,43 @@ All notable changes to `com.intyga:intyga-verify` are documented here. The forma
 
 ## [Unreleased]
 
+## [2.1.0]
+
+- **DEWP 1.1 §4.7 execution evidence** (`ExecutionEvidence`). `Dewp.EvidenceOptions` and
+  `BundleOptions` gain evidence options and results gain `execution`; previous record constructors
+  remain as delegating overloads. `AuditSignatures.verify(c, p, evidence)` keeps evidence-source trust
+  separate from approver trust. The approval verifier refuses the statement type. JDK 17 and 21.
+  As published after the pre-publication review (October 2026): the statement has nine members —
+  `sampledAt` (never later than `observedAt`; the window is evaluated on it) and a per-source gapless
+  integer `sequence` (`418.0`, `"418"`, `0` are malformed) — and `Statement`/`canonicalStatement` take
+  both. Evidence-source keys may be `ExecutionEvidence.SourceKey` entries (or `{key, notBefore?,
+  notAfter?}` maps) with a validity interval that is held to the record's **anchored time** — the
+  earliest external witness time among the anchors that counted toward quorum for the checkpoint the
+  record's OWN inclusion proof names, and only while its seq lies within the range those anchors were
+  held to (the caller's trusted checkpoint record where it states one, else the bundle's first
+  checkpoint for that root) — never another checkpoint's time and never the statement's own clock;
+  both bundle verifiers compute it and `ExecutionEvidence.Options.anchoredTime` is the hook. A bundle
+  that lists one root twice with differing fields is refused (identical duplicates are tolerated). A
+  map key entry with any member other than `key`/`notBefore`/`notAfter`, or with a bound that is
+  present but not a string, verifies a signature but establishes no trust, and an entry with no
+  usable string key is dropped. `AuditSignatures.verify(c, p, evidence, anchoredTimeMs)` holds the
+  §4.6.1 report to the same anchored time (the three-argument form passes none), and both bundle
+  verifiers run it after the anchor quorum, so `signatures.checks` and `execution.checks` agree on a
+  bounded key. A statement binds to any Dispatch Record whose hash matches (the lowest-seq one
+  governs), records for one nonce that disagree are a `dispatchConflict`, the effective deadline is
+  the dispatch's cut to `EvidenceOptions.maxEvidenceWindowSeconds` (default 86 400 s,
+  `windowCapped`), the default skew is 30 s (a negative skew or window falls back to the default), a
+  trusted bound `contradicted` sampled late is a `lateContradiction`, a bound in-window or late
+  `contradicted` whose signature verified under a provisioned key that established no trust is an
+  `untrustedContradiction` (never under the embedded key alone), every Approval Record's nonce is
+  reported, and `sources` carries per-source continuity (first, last, gaps, divergent). `Check` gains
+  `source` and `sequence`; `requireExecutionConfirmed` also fails on a dispatch conflict, a late
+  contradiction, an untrusted contradiction, a gap or a divergence. Pinned by the regenerated
+  `executionEvidence` vectors.
+- Keep bound, late contradictions signed by caller-provisioned keys as untrusted-contradiction
+  findings when key trust is not established. Requiring confirmed execution rejects them even
+  alongside a trusted confirmation; execution status and trust are unchanged.
+
 ## [2.0.0]
 
 - Bind delegation verification to the independently expected requester; a workload cannot reuse

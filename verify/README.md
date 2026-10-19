@@ -12,7 +12,7 @@ Java 17 or newer. One declared runtime dependency — `jackson-databind`, for JS
 <dependency>
   <groupId>com.intyga</groupId>
   <artifactId>intyga-verify</artifactId>
-  <version>2.0.0</version>
+  <version>2.1.0</version>
 </dependency>
 ```
 
@@ -179,3 +179,45 @@ unsigned, redacted, incomplete and invalid entries fail that option. Anchor quor
 
 Pass `new AuditSignatures.Policy(trustedSigners, expectedOrigin, expectedRpId)` and the
 `requireSignatures` boolean in the full `Dewp.BundleOptions` / `Dewp.EvidenceOptions` constructors.
+
+### Execution evidence (DEWP 1.1 §4.7)
+
+`Dewp.verifyEvidenceBundle` additionally reports `execution`: a §4.7.3 check per Evidence Record and
+a §4.7.4 Execution Status per approval nonce — Approval Records included, so an approval with no
+dispatch and no evidence reads `not_reported` rather than being passed over. Evidence-source trust is
+a separate `ExecutionEvidence.Policy` (source → base64 SPKI P-256 keys, bare or as
+`ExecutionEvidence.SourceKey` with `notBefore`/`notAfter`, or a parsed `{key, notBefore?, notAfter?}`
+map), never the approver policy: an approver key never verifies a statement and a source key never
+verifies an approval (§4.7.5). A key with a validity interval establishes trust only at the record's
+**anchored time** — the earliest external witness time (Rekor `integratedTime`, TSA `genTime`) among
+the anchors that counted toward quorum for the checkpoint the record's own inclusion proof names, and
+only while its seq lies within the range those anchors were held to — and never at the statement's
+own `observedAt`/`sampledAt` or at another checkpoint's time; with no counting anchor it establishes
+nothing, and the check's reason says so. A bundle listing one root twice with differing fields is
+refused. A map entry with any other member (a misspelt `notafter`), or a bound that is present but
+not a string, verifies a signature but establishes no trust; an entry with no usable key is dropped.
+The §4.6.1 signature report (`signatures.checks`) is held to the same anchored time, so it agrees
+with the statement check. Both bundle verifiers compute that time themselves;
+`ExecutionEvidence.Options.anchoredTime` is the hook for a direct `evaluate` call, and
+`AuditSignatures.verify(c, p, evidence, anchoredTimeMs)` the one for a single leaf.
+
+The statement carries `sampledAt` (when the measurement was taken; the evidence window is evaluated
+on it) and the source's gapless per-log `sequence` (an integer from 1; `418.0`, `"418"` and `0` are
+malformed). A statement binds to any Dispatch Record whose `payloadSha256` matches — the lowest-seq
+one governs — so an early record carrying another hash cannot unbind it; Dispatch Records for one
+nonce that disagree are reported as a `dispatchConflict`. The effective deadline is the record's
+`evidenceDeadline` cut to `EvidenceOptions.maxEvidenceWindowSeconds` (default 86 400 s;
+`windowCapped` says when the cut applied) and `evidenceSkewSeconds` defaults to 30 s before
+dispatch; a negative value for either falls back to its default. A trusted, bound `contradicted`
+sampled after the deadline stays `stale` but is reported as a `lateContradiction` rather than folded
+into `unconfirmed`; a bound, in-window or late `contradicted` whose signature verified under a provisioned
+key that established no trust (no anchored time, outside its interval, or a malformed entry) is
+reported as an `untrustedContradiction` — it cannot decide the status, and it is never silent. An
+embedded-key contradiction with no policy is neither. `sources` carries per-source continuity
+(first, last, gaps as inclusive ranges, divergent counter values) over the statements whose signature
+verified, which exposes a statement withheld from inside the exported range.
+`requireExecutionConfirmed` fails on any nonce that is not `confirmed`, on a dispatch conflict, a
+late contradiction, an untrusted contradiction, a gap or a divergence, and on a bundle that reports
+no nonce. A single proof (`Dewp.verifyBundle`) can evaluate steps 1–4 only and reports `unbound`; its
+anchored time comes from the proof's own quorum and is given to its signature check as well.
+`confirmed` reports what a caller-trusted source observed, never physical truth (§4.7.6).
