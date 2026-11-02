@@ -309,6 +309,27 @@ class OfflineApprovalTest {
     assertFalse(OfflineApproval.createOfflineChallenge(base.target(null).build()).ok());
   }
 
+  @Test void fourEyesChallengeBindsControllersAndRefusesMissingRequesterEntry() {
+    var payload = ((com.fasterxml.jackson.databind.node.ObjectNode) V.get("bundle").deepCopy());
+    var baseline = ((com.fasterxml.jackson.databind.node.ObjectNode) payload.withArray("policy").get(0));
+    baseline.put("actionPattern", "*");
+    baseline.put("requesterCannotApprove", true);
+    baseline.putArray("excludedSignerDids").add("did:intyga:policy");
+    var policy = JSON.createArrayNode(); policy.add(baseline); payload.set("policy", policy);
+    var controllers = payload.putObject("requesterControllers");
+    controllers.putArray("did:intyga:requester").add("did:intyga:issuer");
+    TrustBundle bundle = TrustBundle.parseUnverified(payload);
+    ChallengeResult ok = OfflineApproval.createOfflineChallenge(ChallengeRequest.builder()
+        .bundle(bundle).target(TARGET).actionType("unknown.action").display("d").params(PARAMS)
+        .requester(new RequesterIdentity("did:intyga:requester", null)).asOf(AS_OF).build());
+    assertTrue(ok.ok(), ok.reason());
+    assertEquals(List.of("did:intyga:issuer", "did:intyga:policy"),
+        ok.challenge().requirement().excludedSignerDids());
+    assertFalse(OfflineApproval.createOfflineChallenge(ChallengeRequest.builder()
+        .bundle(bundle).target(TARGET).actionType("unknown.action").display("d").params(PARAMS)
+        .requester(new RequesterIdentity("did:intyga:stale", null)).asOf(AS_OF).build()).ok());
+  }
+
   // --- signing as an approver ------------------------------------------------------------------------
 
   @Test
@@ -352,7 +373,7 @@ class OfflineApprovalTest {
     SignResult result = OfflineApproval.signChallengeEnvelope(
         legacyEnvelope, aliceOffline(), "did:intyga:alice", AS_OF);
     assertFalse(result.ok());
-    assertTrue(result.reason().contains("legacy v1 offline challenges"), result.reason());
+    assertEquals("legacy DIV v1 challenges are archival-only and cannot be signed", result.reason());
   }
 
   @Test
@@ -381,9 +402,11 @@ class OfflineApprovalTest {
     assertFalse(OfflineApproval.signChallengeEnvelope(envelope, new KeyPair(other.getPublic(), aliceOffline()),
         "did:intyga:alice", AS_OF).ok());
 
-    String canonical = Canonical.canonicalOfflineIntentPayload(TARGET, "db.restart", "d", PARAMS,
+    // Tenant-bound v2: the legacy refusal precedes the expiry check, as in the reference.
+    String canonical = Canonical.canonicalOfflineIntentPayloadWithTenant(TARGET, "db.restart", "d", PARAMS,
         new RequesterIdentity("did:intyga:service:oncall", null),
-        new ApprovalRequirement(1, false, List.of(), false, "human"), "off_x", "2026-10-06T12:00:00.123Z", "soon");
+        new ApprovalRequirement(1, false, List.of(), false, "human"), "off_x", "2026-10-06T12:00:00.123Z", "soon",
+        "11111111-1111-4111-8111-111111111111");
     String unreadable = "DIV1:" + Base64.getUrlEncoder().withoutPadding().encodeToString(canonical.getBytes(StandardCharsets.UTF_8));
     SignResult r = OfflineApproval.signChallengeEnvelope(unreadable, aliceOffline(), "did:intyga:alice", AS_OF);
     assertFalse(r.ok());
@@ -599,5 +622,73 @@ class OfflineApprovalTest {
     JsonNode missing = JSON.readTree(rule("*", 1, "[\"a\"]"));
     ((com.fasterxml.jackson.databind.node.ObjectNode) missing).remove("escalateAfterSeconds");
     assertFalse(BundlePolicy.fromJson(missing).complete());
+  }
+
+  static String deviceRule(String pattern, int quorum, String dids, String device) {
+    String r = rule(pattern, quorum, dids);
+    return r.substring(0, r.length() - 1) + ",\"requireEnrolledDevice\":" + device + "}";
+  }
+
+  /** DIV §4.3.2 / §5a.4 paths the shared vectors do not reach: rule selection and envelopes. */
+  @Test
+  void enrolledDeviceRulesSelectAndRefuseLikeTheReference() throws IOException {
+    // A policy entry carries the field only in a version 2 bundle, and only as true.
+    JsonNode on = JSON.readTree(deviceRule("deploy.production", 1, "[\"a\"]", "true"));
+    assertTrue(BundlePolicy.fromJson(on, 2).complete());
+    assertTrue(BundlePolicy.fromJson(on, 2).requireEnrolledDevice());
+    assertFalse(BundlePolicy.fromJson(on).complete(), "version 1 never carries it");
+    for (String bad : List.of("false", "null", "\"true\"", "1")) {
+      assertFalse(BundlePolicy.fromJson(JSON.readTree(deviceRule("x", 1, "[\"a\"]", bad)), 2).complete(), bad);
+    }
+    assertFalse(BundlePolicy.fromJson(JSON.readTree(rule("x", 1, "[\"a\"]")), 2).requireEnrolledDevice());
+
+    // lostApprovalConstraints treats it like requireHardwareKey; rule strictness is unchanged.
+    List<BundlePolicy> stricter = new ArrayList<>();
+    stricter.add(BundlePolicy.fromJson(JSON.readTree(rule("*", 1, "[\"a\"]")), 2));
+    stricter.add(BundlePolicy.fromJson(on, 2));
+    ApprovalPolicy.validateExactApprovalPolicy(stricter);
+    List<BundlePolicy> dropped = new ArrayList<>();
+    dropped.add(BundlePolicy.fromJson(JSON.readTree(deviceRule("*", 1, "[\"a\"]", "true")), 2));
+    dropped.add(BundlePolicy.fromJson(JSON.readTree(rule("deploy.production", 1, "[\"a\"]")), 2));
+    assertEquals(List.of("requireEnrolledDevice"),
+        assertThrows(ApprovalPolicyConflict.class, () -> ApprovalPolicy.validateExactApprovalPolicy(dropped)).fields());
+    // An auto-approving rule must match the baseline's requirement exactly, enrolled device included.
+    // Same window on both sides, so the device flag is the only difference.
+    String auto = rule("deploy.production", 1, "[\"a\"]")
+        .replace("\"autoApproveRequesterDid\":null", "\"autoApproveRequesterDid\":\"did:intyga:ci\"");
+    String autoDevice = auto.substring(0, auto.length() - 1) + ",\"requireEnrolledDevice\":true}";
+    BundlePolicy plainAuto = BundlePolicy.fromJson(JSON.readTree(auto), 2);
+    assertEquals(List.of(), ApprovalPolicy.lostApprovalConstraints(plainAuto, plainAuto));
+    assertEquals(List.of("autoApproval"), ApprovalPolicy.lostApprovalConstraints(
+        BundlePolicy.fromJson(JSON.readTree(autoDevice), 2), plainAuto));
+    assertEquals(List.of("requireEnrolledDevice", "autoApproval"), ApprovalPolicy.lostApprovalConstraints(
+        plainAuto, BundlePolicy.fromJson(JSON.readTree(autoDevice), 2)));
+
+    // An offline challenge envelope never carries it: `true` cannot be rebuilt into an offline
+    // payload, `false` is never emitted, and a non-boolean cannot be canonicalized.
+    String envelope = null;
+    for (JsonNode c : V.get("challengeEnvelope")) {
+      if (c.get("ok").booleanValue()) { envelope = c.get("envelope").textValue(); break; }
+    }
+    assertNotNull(envelope);
+    String prefix = envelope.substring(0, envelope.indexOf(':') + 1);
+    String payload = new String(Base64.getUrlDecoder().decode(envelope.substring(prefix.length())), StandardCharsets.UTF_8);
+    for (Map.Entry<String, String> c : Map.of(
+        "true", "challenge payload carries values that cannot be canonicalized — refusing to sign it",
+        "null", "challenge payload carries values that cannot be canonicalized — refusing to sign it",
+        "\"yes\"", "challenge payload carries values that cannot be canonicalized — refusing to sign it",
+        "false", "challenge payload is not canonical — re-serializing it produces different bytes, so a"
+            + " signature over it would verify nowhere").entrySet()) {
+      @SuppressWarnings("unchecked")
+      Map<String, Object> m = JSON.readValue(payload, Map.class);
+      @SuppressWarnings("unchecked")
+      Map<String, Object> rq = (Map<String, Object>) m.get("requirement");
+      rq.put("requireEnrolledDevice", JSON.readValue(c.getKey(), Object.class));
+      String tampered = prefix + Base64.getUrlEncoder().withoutPadding()
+          .encodeToString(Canonical.stableStringify(m).getBytes(StandardCharsets.UTF_8));
+      DecodedChallengeResult r = OfflineApproval.decodeChallengeEnvelope(tampered);
+      assertFalse(r.ok(), c.getKey());
+      assertEquals(c.getValue(), r.reason(), c.getKey());
+    }
   }
 }

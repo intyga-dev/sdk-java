@@ -22,6 +22,7 @@ public final class ChallengeRequest {
   private final Map<String, Object> params;
   private final RequesterIdentity requester;
   private final Integer windowMinutes;
+  private final boolean windowIsWhole;
   private final Instant asOf;
   private final String nonce;
   private final VerifiedDelegation delegation;
@@ -41,6 +42,7 @@ public final class ChallengeRequest {
     this.params = Collections.unmodifiableMap(new LinkedHashMap<>(b.params));
     this.requester = b.requester;
     this.windowMinutes = b.windowMinutes;
+    this.windowIsWhole = b.windowIsWhole;
     this.asOf = b.asOf;
     this.nonce = b.nonce;
     this.delegation = b.delegation;
@@ -79,6 +81,14 @@ public final class ChallengeRequest {
     return windowMinutes;
   }
 
+  /**
+   * False when the window was given as a number that is not a whole number of minutes ({@link
+   * Builder#windowMinutes(Number)}); {@link OfflineApproval#createOfflineChallenge} then refuses.
+   */
+  public boolean windowIsWhole() {
+    return windowIsWhole;
+  }
+
   public Instant asOf() {
     return asOf;
   }
@@ -99,6 +109,7 @@ public final class ChallengeRequest {
     private Map<String, Object> params = new LinkedHashMap<>();
     private RequesterIdentity requester;
     private Integer windowMinutes;
+    private boolean windowIsWhole = true;
     private Instant asOf;
     private String nonce;
     private VerifiedDelegation delegation;
@@ -144,6 +155,21 @@ public final class ChallengeRequest {
     /** Validity window; clamped to [1, 60]. */
     public Builder windowMinutes(Integer windowMinutes) {
       this.windowMinutes = windowMinutes;
+      this.windowIsWhole = true;
+      return this;
+    }
+
+    /**
+     * Validity window as any JSON-ish number, as the reference accepts one: a value that is not a
+     * safe integer (2.5, NaN, ±∞, beyond 2^53) makes the challenge refuse with "windowMinutes must
+     * be a whole number of minutes", in the reference's check position. Whole values clamp to [1, 60].
+     */
+    public Builder windowMinutes(Number windowMinutes) {
+      if (windowMinutes == null) return windowMinutes((Integer) null);
+      double d = windowMinutes.doubleValue();
+      boolean whole = Double.isFinite(d) && d == Math.rint(d) && Math.abs(d) <= 9007199254740991d;
+      this.windowIsWhole = whole;
+      this.windowMinutes = whole ? (int) Math.max(Integer.MIN_VALUE, Math.min(Integer.MAX_VALUE, d)) : null;
       return this;
     }
 

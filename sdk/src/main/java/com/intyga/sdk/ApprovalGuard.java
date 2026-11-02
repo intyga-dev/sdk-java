@@ -11,6 +11,7 @@ import com.intyga.verify.RequirementFloor;
 import com.intyga.verify.Verify;
 import com.intyga.verify.VerifyOptions;
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.BiConsumer;
@@ -36,6 +37,7 @@ public final class ApprovalGuard {
   private final String description;
   private final ApproverTrustAnchor approvers;
   private final RequirementFloor requirement;
+  private final List<String> enrolledDeviceKeys;
   private final String tenantId;
   private final VerifyOptions verifyOptions;
   private final Duration timeout;
@@ -56,6 +58,14 @@ public final class ApprovalGuard {
     actionType = b.actionType;
     description = b.description == null ? "Execute " + actionType : b.description;
     requirement = b.requirement;
+    // RP-owned enrolled approver device keys (DIV §4.3.2): refused at construction, like the
+    // reference guard, rather than surfacing as a verification failure on the first call.
+    if (b.enrolledDeviceKeys != null
+        && b.enrolledDeviceKeys.stream().anyMatch(k -> k == null || k.isEmpty())) {
+      throw new IllegalArgumentException(
+          "ApprovalGuard.enrolledDeviceKeys must be an array of non-empty base64 keys");
+    }
+    enrolledDeviceKeys = b.enrolledDeviceKeys == null ? null : List.copyOf(b.enrolledDeviceKeys);
     tenantId = b.tenantId;
     verifyOptions = VerifyOptions.builder().expectedOrigin(b.expectedOrigin)
         .expectedRpId(b.expectedRpId).build();
@@ -92,7 +102,8 @@ public final class ApprovalGuard {
       }
       var checked = Verify.verifyApprovalReceipt(ApprovalReceipt.parse(approval.receipt()),
           new Expected(target, approval.nonce(), actionType, bound, approvers)
-              .withRequirement(requirement).withTenantId(tenantId),
+              .withRequirement(requirement).withTenantId(tenantId)
+              .withEnrolledDeviceKeys(enrolledDeviceKeys),
           verifyOptions);
       if (!checked.ok()) {
         throw new IntygaException("Tool approval unverified: " + checked.reason());
@@ -139,6 +150,7 @@ public final class ApprovalGuard {
     private String actionType;
     private String description;
     private RequirementFloor requirement;
+    private List<String> enrolledDeviceKeys;
     private String tenantId;
     private String expectedOrigin;
     private String expectedRpId;
@@ -157,6 +169,16 @@ public final class ApprovalGuard {
     public Builder description(String value) { description = value; return this; }
     /** Recommended: the minimum quorum and restrictions required by your deployment. */
     public Builder requirement(RequirementFloor value) { requirement = value; return this; }
+    /**
+     * Your enrolled approver device keys (DIV §4.3.2; base64 SPKI or COSE), from your own enrollment
+     * records — e.g. {@code TrustAnchorFile.enrolledDeviceKeys()}. Required to verify a receipt whose
+     * signed policy demands an enrolled device; each key must also be trusted in {@code approvers}.
+     * A null or empty entry is refused when the guard is built. Null (the default) supplies none.
+     */
+    public Builder enrolledDeviceKeys(List<String> value) {
+      enrolledDeviceKeys = value == null ? null : new java.util.ArrayList<>(value);
+      return this;
+    }
     /**
      * The independently trusted tenant expected on DIV v2 receipts: supply it from your trust anchor
      * or other independently trusted configuration; it is never inferred from the gateway response or

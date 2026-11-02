@@ -17,20 +17,34 @@ import java.util.Map;
  * and two passkeys satisfy a 3-of-N quorum alone.
  */
 public final class ApproverDirectory {
+  private final List<String> dids;
   private final Map<String, List<String>> byDid;
 
+  /** Every DID in {@code byDid} is eligible. */
   ApproverDirectory(Map<String, List<String>> byDid) {
+    this(new ArrayList<>(byDid.keySet()), byDid);
+  }
+
+  /**
+   * {@code dids} are the eligible approvers; {@code byDid} may also resolve keys for identities
+   * that are NOT eligible, so the verifier can recognise a key bound to one of them.
+   */
+  ApproverDirectory(List<String> dids, Map<String, List<String>> byDid) {
     Map<String, List<String>> copy = new LinkedHashMap<>();
     byDid.forEach((did, keys) -> copy.put(did, List.copyOf(keys)));
+    this.dids = List.copyOf(dids);
     this.byDid = Collections.unmodifiableMap(copy);
   }
 
   /** The eligible approver DIDs, in bundle (or file) order. */
   public List<String> dids() {
-    return List.copyOf(byDid.keySet());
+    return dids;
   }
 
-  /** Every key bound to {@code did}, or null when the DID is not eligible or lists no keys. */
+  /**
+   * Every key bound to {@code did}, or null when the bundle knows no keys for it. Resolution is
+   * wider than eligibility: a non-eligible DID can resolve, and {@link #dids()} alone says who counts.
+   */
   public List<String> resolveKey(String did) {
     List<String> keys = byDid.get(did);
     return keys == null || keys.isEmpty() ? null : keys;
@@ -42,7 +56,7 @@ public final class ApproverDirectory {
    */
   public ApproverTrustAnchor toTrustAnchor() {
     return ApproverTrustAnchor.ofDidsMultiKey(
-        new ArrayList<>(byDid.keySet()),
+        dids,
         did -> {
           List<String> keys = byDid.get(did);
           return keys == null ? List.of() : keys;

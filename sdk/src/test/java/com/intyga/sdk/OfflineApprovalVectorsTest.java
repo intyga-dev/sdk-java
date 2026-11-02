@@ -184,6 +184,58 @@ class OfflineApprovalVectorsTest {
     return m;
   }
 
+  /**
+   * Every refusal carries the reference reason: exact {@code reason}, or {@code reasonPrefix} where
+   * the text embeds a platform library's own message. Mirrors assertReason in offline-vectors.test.ts.
+   */
+  private static final JsonNode HINTS = loadHints();
+
+  private static JsonNode loadHints() {
+    try {
+      return JSON.readTree(Files.readString(Path.of("vectors/api-name-hints.json")));
+    } catch (IOException e) {
+      throw new IllegalStateException("cannot read api-name-hints.json", e);
+    }
+  }
+
+  /**
+   * The vectors write texts with the TypeScript API names; Java's own spellings come from the
+   * {@code java} map of api-name-hints.json, longest token first, through placeholders so a value
+   * is never rescanned (localized() in offline-vectors.test.ts).
+   */
+  static String localized(String text) {
+    List<String> order = new ArrayList<>();
+    HINTS.get("tokens").forEach(t -> order.add(t.textValue()));
+    order.sort((a, b) -> Integer.compare(b.length(), a.length()));
+    String out = text;
+    for (int i = 0; i < order.size(); i++) out = out.replace(order.get(i), "\u0000" + i + "\u0000");
+    for (int i = 0; i < order.size(); i++) {
+      out = out.replace("\u0000" + i + "\u0000", HINTS.get("java").get(order.get(i)).textValue());
+    }
+    return out;
+  }
+
+  @Test
+  void javaApiNameMapCoversExactlyTheTokens() {
+    java.util.Set<String> tokens = new java.util.TreeSet<>();
+    HINTS.get("tokens").forEach(t -> tokens.add(t.textValue()));
+    java.util.Set<String> mapped = new java.util.TreeSet<>();
+    HINTS.get("java").fieldNames().forEachRemaining(mapped::add);
+    assertEquals(tokens, mapped);
+  }
+
+  static void assertReason(JsonNode c, String got) {
+    String label = c.path("name").asText();
+    if (c.has("reason")) {
+      assertEquals(localized(c.get("reason").textValue()), got, label + ": reason");
+    } else if (c.has("reasonPrefix")) {
+      String prefix = localized(c.get("reasonPrefix").textValue());
+      assertTrue(got != null && got.startsWith(prefix), label + ": reason " + got + " lacks prefix " + prefix);
+    } else {
+      fail(label + ": a refusal vector must carry reason or reasonPrefix");
+    }
+  }
+
   static Instant at(JsonNode c) {
     return Instant.parse(c.get("asOf").textValue());
   }
@@ -236,12 +288,22 @@ class OfflineApprovalVectorsTest {
       pn.put("autoApproveWindowEnd", p.autoApproveWindowEnd());
       pn.put("actionPattern", p.actionPattern());
       pn.set("approverDids", JSON.valueToTree(p.approverDids()));
+      if (p.excludedSignerDids() != null) {
+        pn.set("excludedSignerDids", JSON.valueToTree(p.excludedSignerDids()));
+      }
+      // Only ever true, and only in a version 2 bundle (DIV §5a.4).
+      if (p.requireEnrolledDevice()) {
+        pn.put("requireEnrolledDevice", true);
+      }
       if (p.selectionRank() != null) {
         pn.put("selectionRank", p.selectionRank());
       }
       if (p.selectionKey() != null) {
         pn.put("selectionKey", p.selectionKey());
       }
+    }
+    if (!b.requesterControllers().isEmpty()) {
+      o.set("requesterControllers", JSON.valueToTree(b.requesterControllers()));
     }
     o.put("unmatchedActionPolicy", b.unmatchedActionPolicy());
     o.put("issuedAt", b.issuedAt());
@@ -255,7 +317,10 @@ class OfflineApprovalVectorsTest {
         n.get("requireHardwareKey").booleanValue(),
         strings(n.get("allowedAaguids")),
         n.get("requesterCannotApprove").booleanValue(),
-        n.get("signerClass").textValue());
+        n.get("signerClass").textValue(),
+        n.has("excludedSignerDids") ? strings(n.get("excludedSignerDids")) : null,
+        // Absent stays null (the field is not signed); present is the signed value.
+        n.has("requireEnrolledDevice") ? Boolean.valueOf(n.get("requireEnrolledDevice").booleanValue()) : null);
   }
 
   static RequesterIdentity requesterOf(JsonNode n) {
@@ -265,7 +330,8 @@ class OfflineApprovalVectorsTest {
         a == null || a.isNull()
             ? null
             : new RequesterAttestation(
-                a.get("method").textValue(), a.get("issuer").textValue(), a.get("subject").textValue()));
+                a.get("method").textValue(), a.get("issuer").textValue(), a.get("subject").textValue()),
+        n.has("credentialIssuerDid") ? n.get("credentialIssuerDid").textValue() : null);
   }
 
   static AnchorPurpose purposeOf(String wire) {
@@ -313,7 +379,7 @@ class OfflineApprovalVectorsTest {
       if (r.ok()) {
         assertJsonEquals(c.get("bundle"), bundleToJson(r.bundle()), name(c));
       } else {
-        assertNotNull(r.reason(), name(c));
+        assertReason(c, r.reason());
         assertNull(r.bundle(), name(c));
       }
     }));
@@ -321,19 +387,38 @@ class OfflineApprovalVectorsTest {
 
   @TestFactory
   Stream<DynamicNode> bundleAnchor() {
-    TrustBundle bundle = TrustBundle.parseUnverified(V.get("bundle"));
     return cases("bundleAnchor").map(c -> {
       JsonNode limit = c.get("limitToDids");
       String label = c.get("purpose").textValue() + (limit == null || limit.isNull() ? "" : " " + limit);
       return DynamicTest.dynamicTest(label, () -> {
+        ObjectNode payload = V.get("bundle").deepCopy();
+        if (c.has("approvers")) payload.set("approvers", c.get("approvers"));
+        if (c.has("controllerKeys")) payload.set("controllerKeys", c.get("controllerKeys"));
+        TrustBundle bundle = TrustBundle.parseUnverified(payload);
         ApproverDirectory dir = null;
+        String reason = null;
         try {
           dir = bundle.approverDirectory(
-              limit == null || limit.isNull() ? null : strings(limit), purposeOf(c.get("purpose").textValue()));
+              limit == null || limit.isNull() ? null : strings(limit), purposeOf(c.get("purpose").textValue()),
+              c.has("excludedDids") ? strings(c.get("excludedDids")) : List.of());
         } catch (IllegalArgumentException refused) {
           assertFalse(c.get("ok").booleanValue(), label + " unexpectedly refused: " + refused.getMessage());
+          reason = refused.getMessage();
         }
         assertEquals(c.get("ok").booleanValue(), dir != null, label);
+        if (dir == null) {
+          assertReason(c, reason);
+          // The anchor form refuses the same way (an exception, never an empty fail-closed anchor).
+          String anchorReason = null;
+          try {
+            bundle.approverAnchor(limit == null || limit.isNull() ? null : strings(limit),
+                purposeOf(c.get("purpose").textValue()),
+                c.has("excludedDids") ? strings(c.get("excludedDids")) : List.of());
+          } catch (IllegalArgumentException refused) {
+            anchorReason = refused.getMessage();
+          }
+          assertReason(c, anchorReason);
+        }
         if (dir == null) return;
         assertEquals(strings(c.get("expect").get("dids")), dir.dids(), label);
         ApproverDirectory checkedDir = dir;
@@ -350,10 +435,14 @@ class OfflineApprovalVectorsTest {
   Stream<DynamicNode> requirementFor() {
     return cases("requirementFor").map(c -> DynamicTest.dynamicTest(name(c), () -> {
       ObjectNode payload = V.get("bundle").deepCopy();
+      // Harness input (docs/OFFLINE-APPROVAL-SDK.md, "Running the vectors"): the bundle's `v`.
+      if (c.has("bundleVersion")) payload.set("v", c.get("bundleVersion"));
       payload.set("policy", c.get("policy"));
       payload.set("unmatchedActionPolicy", c.get("unmatchedActionPolicy"));
+      if (c.has("requesterControllers")) payload.set("requesterControllers", c.get("requesterControllers"));
       Optional<ResolvedRequirement> got = TrustBundle.parseUnverified(payload)
-          .requirementFor(c.get("actionType").textValue(), c.get("display").textValue());
+          .requirementFor(c.get("actionType").textValue(), c.get("display").textValue(),
+              c.has("requesterDid") ? c.get("requesterDid").textValue() : null);
       JsonNode expect = c.get("expect");
       if (expect.isNull()) {
         assertTrue(got.isEmpty(), name(c) + " should refuse");
@@ -371,6 +460,7 @@ class OfflineApprovalVectorsTest {
       TrustAnchorPurpose purpose =
           "offline".equals(c.get("purpose").textValue()) ? TrustAnchorPurpose.OFFLINE : TrustAnchorPurpose.ONLINE;
       ObjectNode got = null;
+      String reason = null;
       try {
         TrustAnchorFile parsed = TrustAnchorFile.parse(c.get("text").textValue(), purpose);
         ApproverDirectory dir = parsed.approverDirectory(null);
@@ -383,13 +473,17 @@ class OfflineApprovalVectorsTest {
         for (String did : dir.dids()) {
           keys.set(did, JSON.valueToTree(dir.resolveKey(did)));
         }
+        // trustAnchorEnrolledDeviceKeys: carried only when the file names some (an empty list reads as absent).
+        if (!parsed.enrolledDeviceKeys().isEmpty()) got.set("enrolledDeviceKeys", JSON.valueToTree(parsed.enrolledDeviceKeys()));
         assertNotNull(parsed.approverAnchor(null));
       } catch (IllegalArgumentException refused) {
-        assertTrue(refused.getMessage().startsWith("invalid trust-anchor file: "), refused.getMessage());
+        reason = refused.getMessage();
       }
       assertEquals(c.get("ok").booleanValue(), got != null, name(c));
       if (c.get("ok").booleanValue()) {
         assertJsonEquals(c.get("expect"), got, name(c));
+      } else {
+        assertReason(c, reason);
       }
     }));
   }
@@ -399,9 +493,16 @@ class OfflineApprovalVectorsTest {
     return cases("createChallenge").map(c -> DynamicTest.dynamicTest(name(c), () -> {
       JsonNode in = c.get("input");
       ObjectNode bundlePayload = V.get("bundle").deepCopy();
+      // Harness inputs: the bundle's `v` and a replacement `policy`.
+      if (in.has("bundleVersion")) bundlePayload.set("v", in.get("bundleVersion"));
+      if (in.has("bundlePolicy")) bundlePayload.set("policy", in.get("bundlePolicy"));
       if (in.has("bundleTenantId")) {
         if (in.get("bundleTenantId").isNull()) bundlePayload.remove("tenantId");
         else bundlePayload.set("tenantId", in.get("bundleTenantId"));
+      }
+      if (in.has("bundleRequesterControllers")) {
+        if (in.get("bundleRequesterControllers").isNull()) bundlePayload.remove("requesterControllers");
+        else bundlePayload.set("requesterControllers", in.get("bundleRequesterControllers"));
       }
       TrustBundle bundle = TrustBundle.parseUnverified(bundlePayload);
       ChallengeRequest.Builder req = ChallengeRequest.builder()
@@ -416,14 +517,8 @@ class OfflineApprovalVectorsTest {
         req.nonce(in.get("nonce").textValue());
       }
       if (in.has("windowMinutes")) {
-        JsonNode w = in.get("windowMinutes");
-        if (!w.canConvertToInt() || w.doubleValue() != Math.rint(w.doubleValue())) {
-          // windowMinutes is an Integer here, so a fractional (or out-of-range) window cannot even be
-          // expressed: the reference's refusal is enforced by the type. Such a case must be a refusal.
-          assertFalse(c.get("ok").booleanValue(), name(c) + ": a window Java cannot express must be refused");
-          return;
-        }
-        req.windowMinutes(w.intValue());
+        // Through the Number overload, so a fractional window is refused at the reference's position.
+        req.windowMinutes(in.get("windowMinutes").numberValue());
       }
       JsonNode d = in.get("delegation");
       if (d != null && !d.isNull()) {
@@ -441,6 +536,7 @@ class OfflineApprovalVectorsTest {
       ChallengeResult r = OfflineApproval.createOfflineChallenge(req.build());
       assertEquals(c.get("ok").booleanValue(), r.ok(), name(c) + ": " + r.reason());
       if (!r.ok()) {
+        assertReason(c, r.reason());
         assertNull(r.challenge(), name(c));
         return;
       }
@@ -471,7 +567,7 @@ class OfflineApprovalVectorsTest {
       DecodedChallengeResult r = OfflineApproval.decodeChallengeEnvelope(c.get("envelope").textValue());
       assertEquals(c.get("ok").booleanValue(), r.ok(), name(c) + ": " + r.reason());
       if (!r.ok()) {
-        assertNotNull(r.reason(), name(c));
+        assertReason(c, r.reason());
         return;
       }
       DecodedChallenge d = r.challenge();
@@ -518,6 +614,8 @@ class OfflineApprovalVectorsTest {
         assertEquals(c.get("ok").booleanValue(), r.ok(), name(c) + ": " + r.reason());
         if (r.ok()) {
           assertEquals(witnessOf(c.get("witness")), r.witness(), name(c));
+        } else {
+          assertReason(c, r.reason());
         }
       }));
     }
@@ -534,6 +632,7 @@ class OfflineApprovalVectorsTest {
           c.get("envelope").textValue(), key, c.get("signerDid").textValue(), at(c));
       assertEquals(c.get("ok").booleanValue(), r.ok(), name(c) + ": " + r.reason());
       if (!r.ok()) {
+        assertReason(c, r.reason());
         assertNull(r.envelope(), name(c));
         return;
       }
@@ -619,7 +718,7 @@ class OfflineApprovalVectorsTest {
         try (var entries = Files.list(dir.resolve(".redeemed"))) { assertEquals(0, entries.count()); }
       }
       if (!r.ok()) {
-        assertNotNull(r.reason(), name(c));
+        assertReason(c, r.reason());
         assertNull(r.receipt(), name(c));
         return;
       }

@@ -3,7 +3,82 @@
 All notable changes to `com.intyga:intyga-verify` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [2.3.0]
+
+- DIV §4.3.2 "Enrolled approver devices" (targets DIV 1.3.0). `ApprovalRequirement` gains a
+  `Boolean requireEnrolledDevice` component (null when absent; existing constructors unchanged) and
+  `requiresEnrolledDevice()`. The intent builder signs it only when `TRUE`, as `true`; the offline,
+  delegation and agent-authority builders throw "requireEnrolledDevice is defined only for ordinary
+  approval intents (DIV §4.3.2)", and every builder throws "requireEnrolledDevice cannot be combined
+  with requireHardwareKey or allowedAaguids (DIV §4.3.2)". Jackson binds the field strictly: absent
+  stays null, only the literal `true` is `TRUE`, and `false`, `null` or any other value is refused as
+  malformed by the verifiers (no boolean coercion).
+- `verifyApprovalReceipt` checks the field after the signer class and before the requirement floor
+  (malformed, offline intent, hardware combination), then, under a signed `true` and before counting,
+  requires `Expected.enrolledDeviceKeys()` (new component; `withEnrolledDeviceKeys(...)`; the
+  nine-argument constructor is kept). A witness then counts only if it is ES256 and the TRUSTED key
+  it verified under is one of those keys, compared by key identity so SPKI and COSE spellings match.
+  `verifyDelegation` and `verifyAgentAuthority` refuse any `requireEnrolledDevice`. New public reason
+  constants `Verify.ENROLLED_DEVICE_*_REASON`.
+- `RequirementFloor` gains `requireEnrolledDevice` (the three- and four-argument constructors are
+  kept; `withRequireEnrolledDevice`): a signed requirement without it is refused as weaker ("it does
+  not require an enrolled approver device (DIV §5 step 3d)"). New `RequirementFloor.fromJson`, which
+  refuses a wrongly typed floor with the verifier's malformed-floor text.
+- Pinned by the `enrolledDevice` section of `verifier-parity-vectors.json` and the new
+  `intentPayloads` vector of `canonical-vectors.json`, on JDK 17 and 21.
+
+## [2.2.0]
+
+- An explicit `null` `requester.credentialIssuerDid` in a receipt, or `null` signed
+  `requirement.excludedSignerDids`, is refused as malformed with the reference's reasons instead of
+  being bound as Java `null` (DIV §4.3.2): Jackson now binds it as `""` / `[""]`. No record component
+  changes type. The canonical builders now throw `NonPortableValueException` for a malformed issuer
+  DID ("credentialIssuerDid must be a valid DID") or exclusion entry ("excludedSignerDids must be a
+  DID array"), as the other ports do. Pinned by `null-credential-issuer-refused-not-dropped` and
+  `null-signed-excluded-signer-dids-refused-not-dropped`.
+- A WebAuthn assertion signature must be ASN.1 DER, as in every other port; the raw r‖s encoding is
+  refused (bare-key ES256 witnesses still accept both). Pinned by `webauthn-raw-signature-refused`.
+- An empty, non-JSON or untypable `canonicalPayload` is refused as "unsupported DIV payload version
+  (unparseable)" by every verifier, as in TS (was "canonicalPayload is not valid JSON" / "missing
+  canonicalPayload"). Pinned by `unparseable-payload-refused`.
+- A DID-mode resolver that throws while resolving an EXCLUDED identity's keys now refuses the
+  verification instead of contributing no keys; returning no keys is unchanged.
+- Requirement floors accept repeated `excludedSignerDids` and refuse malformed DIDs as malformed.
+- `requireExecutionConfirmed` now fails closed on any covered `COMMITMENT_ONLY` entry; ordinary
+  inclusion verification remains compatible and reports the redaction.
+- Refusal reasons and check order now match the TypeScript reference exactly, pinned by exact
+  `reason` assertions on the shared parity vectors. Identity extensions are checked after the
+  quorum minimum and before the signer class: a malformed `credentialIssuerDid`, then a malformed
+  `excludedSignerDids` ("must be an array of valid DIDs", every entry checked before repetition),
+  then a repeated DID ("must not contain duplicates").
+- A key aliased to an excluded identity is no longer refused through a separate taint set: the
+  excluded identities' keys are counted first, so the alias is reported with the shared-key reason
+  ("… already counted for excluded identity <did> …", DIV §4.4.6). Verdicts are unchanged.
+- Trust-anchor candidate refusals, tenant-binding refusals, the agent-authority and platform
+  verifiers, delegation use-time checks (tenant, then expiry, target, action, params, quorum) and the
+  approval path (`agent context was expected …`, dedicated agent-authority and platform-intent type
+  refusals, the requester check after expiry) use the reference's texts and order. A delegation
+  whose `delegatedTo` lists an empty or null entry is refused as malformed; an empty list reports
+  the distinct-operator count. Window lengths print like JavaScript's `toFixed(1)` in every locale.
+- Refusal texts that name a caller-facing option, field or function use the Java API names
+  (`VerifyOptions.builder().allowExpired(true)`, `expected.target()`, `Verify.verifyDelegation`,
+  `ApproverTrustAnchor.ofDids / ofDidsMultiKey`, …), recorded in the `java` map of
+  `api-name-hints.json`; the rest of each text is the reference's. The parity harness rewrites the
+  vectors' TypeScript names through that map before comparing.
+- An empty expected nonce refuses with "expected.nonce() is required — it must be the challenge YOU
+  issued (DIV §5 step 10)" immediately before the nonce comparison, on the approval and platform
+  paths alike.
+- A malformed requirement floor reports one text, and the floor checks run in the reference's order
+  (exclusions first: "it omits a required signer exclusion").
+- The parity harness runs the new `delegation` section, maps `expected.tenantId`, and supports a
+  DID-mode anchor with no resolver.
+- New `Verify.verifyWebAuthnWitness(WebAuthnWitness, WebAuthnWitnessExpectation)` verifies one
+  stored WebAuthn assertion on its own, as the reference's `verifyWebAuthnWitness`: expectations,
+  then each field ("WebAuthn witness missing <field>"), then the assertion check the receipt path
+  runs, now one shared implementation. It returns a `VerifyResult` and never throws. That shared
+  check now reads base64 as the reference does and reports key and clientDataJSON parse failures as
+  "WebAuthn verification failed: …"; COSE refusals carry the reference's texts. Pinned by the new
+  `webauthnWitness` parity section and golden-vector tests.
 
 ## [2.1.0]
 

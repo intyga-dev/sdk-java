@@ -50,4 +50,13 @@ public final class Div {
   static final int MAX_REPORTED_FAILURES = 8;
 
   private Div() {}
+
+  /**
+   * JavaScript's {@code x.toFixed(1)} for a finite double: rounds the EXACT binary value, ties away
+   * from zero. {@code String.format("%.1f")} rounds the shortest decimal representation instead (so
+   * 30.15, stored as 30.1499…, prints 30.2) and follows the default locale (a decimal comma).
+   */
+  static String toFixed1(double x) {
+    return new java.math.BigDecimal(x).setScale(1, java.math.RoundingMode.HALF_UP).toPlainString();
+  }
 }

@@ -18,6 +18,8 @@ public final class BundlePolicy implements ApprovalPolicy.Rule {
   private final boolean requireHardwareKey;
   private final List<String> allowedAaguids;
   private final boolean requesterCannotApprove;
+  private final boolean requireEnrolledDevice;
+  private final List<String> excludedSignerDids;
   private final boolean requireAttestedRequester;
   private final List<String> allowedIssuers;
   private final List<String> approverDids;
@@ -33,7 +35,7 @@ public final class BundlePolicy implements ApprovalPolicy.Rule {
   private final String selectionKey;
   private final boolean complete;
 
-  private BundlePolicy(JsonNode p) {
+  private BundlePolicy(JsonNode p, long version) {
     boolean object = p != null && p.isObject();
     JsonNode n = object ? p : Js.JSON.createObjectNode();
     this.signerClass = Js.text(n.get("signerClass"));
@@ -43,6 +45,8 @@ public final class BundlePolicy implements ApprovalPolicy.Rule {
     this.requireHardwareKey = bool(n.get("requireHardwareKey"));
     this.allowedAaguids = Js.strings(n.get("allowedAaguids"));
     this.requesterCannotApprove = bool(n.get("requesterCannotApprove"));
+    this.requireEnrolledDevice = bool(n.get("requireEnrolledDevice"));
+    this.excludedSignerDids = n.has("excludedSignerDids") ? Js.strings(n.get("excludedSignerDids")) : null;
     this.requireAttestedRequester = bool(n.get("requireAttestedRequester"));
     this.allowedIssuers = Js.strings(n.get("allowedIssuers"));
     this.approverDids = Js.strings(n.get("approverDids"));
@@ -60,16 +64,24 @@ public final class BundlePolicy implements ApprovalPolicy.Rule {
     this.autoApproveWindowEnd = Js.text(n.get("autoApproveWindowEnd"));
     this.selectionRank = Js.isSafeInteger(n.get("selectionRank")) ? n.get("selectionRank").longValue() : null;
     this.selectionKey = Js.text(n.get("selectionKey"));
-    this.complete = object && validBundlePolicy(p);
-  }
-
-  /** Project one bundle {@code policy} entry. Never throws; check {@link #complete()}. */
-  public static BundlePolicy fromJson(JsonNode entry) {
-    return new BundlePolicy(entry);
+    this.complete = object && validBundlePolicy(p, version);
   }
 
   /**
-   * {@code validBundlePolicy} from the reference: every v1 field present with its exact type —
+   * Project one version 1 bundle {@code policy} entry. Never throws; check {@link #complete()}. An
+   * entry carrying {@code requireEnrolledDevice} is incomplete here: only version 2 admits it.
+   */
+  public static BundlePolicy fromJson(JsonNode entry) {
+    return new BundlePolicy(entry, 1);
+  }
+
+  /** Project one {@code policy} entry of a bundle with the given {@code v} (DIV §5a.4). */
+  public static BundlePolicy fromJson(JsonNode entry, long version) {
+    return new BundlePolicy(entry, version);
+  }
+
+  /**
+   * {@code validBundlePolicy(entry, version)} from the reference: every v1 field present with its exact type —
    * {@code signerClass} "human", a non-blank pattern, a safe-integer quorum ≥ 1, the three booleans,
    * the four DID/AAGUID/issuer lists of non-empty strings, and the escalation/auto-approve fields
    * present as null or a valid value. A missing field is not a default; it is an incomplete export.
@@ -78,11 +90,17 @@ public final class BundlePolicy implements ApprovalPolicy.Rule {
    * string lists, so they can be compared rather than throw (stricter than the reference, which
    * would fail on a non-list there with an exception rather than a refusal).
    */
-  static boolean validBundlePolicy(JsonNode p) {
+  static boolean validBundlePolicy(JsonNode p, long version) {
     if (p == null || !p.isObject()) {
       return false;
     }
     if (!"human".equals(Js.text(p.get("signerClass")))) {
+      return false;
+    }
+    // DIV §5a.4: version 2 admits `requireEnrolledDevice: true` and nothing else under that key; a
+    // version 1 bundle never carries it, so an older reader cannot meet it read as weaker.
+    JsonNode device = p.get("requireEnrolledDevice");
+    if (device != null && (version != 2 || !device.isBoolean() || !device.booleanValue())) {
       return false;
     }
     JsonNode pattern = p.get("actionPattern");
@@ -103,6 +121,10 @@ public final class BundlePolicy implements ApprovalPolicy.Rule {
         return false;
       }
     }
+    JsonNode excluded = p.get("excludedSignerDids");
+    // A set: a repeated DID is accepted, as in the reference, and deduplicated when signed.
+    if (excluded != null && (!Js.isStringArray(excluded, true)
+        || Js.strings(excluded).stream().anyMatch(d -> !validDid(d)))) return false;
     JsonNode escalate = p.get("escalateAfterSeconds");
     if (escalate == null
         || (!escalate.isNull() && (!Js.isSafeInteger(escalate) || escalate.doubleValue() < 1))) {
@@ -127,6 +149,20 @@ public final class BundlePolicy implements ApprovalPolicy.Rule {
   private static boolean validDay(JsonNode day) {
     double d = day.doubleValue();
     return d >= 0 && d <= 6;
+  }
+
+  private static boolean validDid(String did) {
+    if (did == null || !did.startsWith("did:") || did.length() == 4
+        || did.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 4096) return false;
+    for (int i = 0; i < did.length(); i++) {
+      char c = did.charAt(i);
+      if (c <= 0x20 || c == 0x7f) return false;
+      if (Character.isSurrogate(c)) {
+        if (i + 1 >= did.length() || !Character.isSurrogatePair(c, did.charAt(i + 1))) return false;
+        i++;
+      }
+    }
+    return true;
   }
 
   private static boolean bool(JsonNode n) {
@@ -166,6 +202,18 @@ public final class BundlePolicy implements ApprovalPolicy.Rule {
   @Override
   public boolean requesterCannotApprove() {
     return requesterCannotApprove;
+  }
+
+  @Override
+  public List<String> excludedSignerDids() { return excludedSignerDids; }
+
+  /**
+   * DIV §4.3.2 / §5a.4: true only in a version 2 bundle whose entry sets it. No offline challenge
+   * can be created under such a rule — an offline key is not an enrolled approver device.
+   */
+  @Override
+  public boolean requireEnrolledDevice() {
+    return requireEnrolledDevice;
   }
 
   @Override

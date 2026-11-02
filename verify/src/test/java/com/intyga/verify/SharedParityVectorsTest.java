@@ -23,6 +23,35 @@ final class SharedParityVectorsTest {
     } catch (IOException e) { throw new IllegalStateException(e); }
   }
 
+  /**
+   * The vectors write refusal texts with the TypeScript API names; Java's own names come from the
+   * {@code java} map of api-name-hints.json. Longest token first, through placeholders, so a
+   * replacement is never rescanned (packages/verify/src/verifier-parity-vectors.test.ts localized()).
+   */
+  private static final JsonNode HINTS = loadHints();
+  private static JsonNode loadHints() {
+    try {
+      return Records.JSON.readTree(Files.readString(Path.of("vectors", "api-name-hints.json")));
+    } catch (IOException e) { throw new IllegalStateException(e); }
+  }
+  static String localized(String text) {
+    List<String> order = new ArrayList<>();
+    HINTS.path("tokens").forEach(t -> order.add(t.asText()));
+    order.sort((a, b) -> Integer.compare(b.length(), a.length()));
+    String out = text;
+    for (int i = 0; i < order.size(); i++) out = out.replace(order.get(i), "\u0000" + i + "\u0000");
+    for (int i = 0; i < order.size(); i++) out = out.replace("\u0000" + i + "\u0000", HINTS.path("java").path(order.get(i)).asText());
+    return out;
+  }
+
+  @Test void javaApiNameMapCoversExactlyTheTokens() {
+    Set<String> tokens = new java.util.TreeSet<>();
+    HINTS.path("tokens").forEach(t -> tokens.add(t.asText()));
+    Set<String> mapped = new java.util.TreeSet<>();
+    HINTS.path("java").fieldNames().forEachRemaining(mapped::add);
+    assertEquals(tokens, mapped, "api-name-hints.json java map must name exactly the tokens");
+  }
+
   /** Merge a section's shared options with one case's overrides; the case wins. */
   private static ObjectNode merge(JsonNode section, JsonNode overrides) {
     ObjectNode merged = section.isObject() ? section.deepCopy() : Records.JSON.createObjectNode();
@@ -43,6 +72,7 @@ final class SharedParityVectorsTest {
     if (o.has("expectedRpId")) b.expectedRpId(o.path("expectedRpId").asText());
     if (o.has("clockSkewSeconds")) b.clockSkewSeconds(o.path("clockSkewSeconds").asInt());
     if (o.path("allowOffline").asBoolean(false)) b.allowOffline(true);
+    if (o.path("allowExpired").asBoolean(false)) b.allowExpired(true);
     if (o.has("requireUserVerification")) b.requireUserVerification(o.path("requireUserVerification").asBoolean());
     return b.build();
   }
@@ -56,16 +86,54 @@ final class SharedParityVectorsTest {
     assertEquals(want, got, c.path("name").asText() + " signers");
   }
 
-  /** A case's optional relying-party requirement floor (DIV §5 step 3d). */
+  /**
+   * A case's optional relying-party requirement floor (DIV §5 step 3d), through the library's own
+   * JSON reading. The typed record cannot hold a wrongly typed flag, so {@link RequirementFloor#fromJson}
+   * is where Java refuses one, with the verifier's malformed-floor text: the caller receives that
+   * refusal instead of a verification result, and {@link #floorRefusal} asserts it like a verdict.
+   */
   private static RequirementFloor floor(JsonNode expected) {
-    JsonNode f = expected.get("requirement");
-    if (f == null || f.isNull()) return null;
-    return new RequirementFloor(f.path("requiredApprovals").asInt(), f.path("requesterCannotApprove").asBoolean(false), f.path("requireHardwareKey").asBoolean(false));
+    return RequirementFloor.fromJson(expected.get("requirement"));
+  }
+
+  /** The malformed-floor refusal, or null when the case's floor reads. Asserted as a refused verdict. */
+  private static String floorRefusal(JsonNode c, JsonNode expected) {
+    try {
+      floor(expected);
+      return null;
+    } catch (IllegalArgumentException malformed) {
+      assertFalse(c.path("ok").asBoolean(), c.path("name").asText() + ": floor refused: " + malformed.getMessage());
+      assertFalse(c.has("signers"), c.path("name").asText() + ": a refused floor credits no signers");
+      assertReason(c, malformed.getMessage());
+      return malformed.getMessage();
+    }
+  }
+
+  /**
+   * The enrolledDevice section's harness input: {@code enrolledDeviceKeyIds} map through the
+   * section's keys to SPKI; a literal {@code enrolledDeviceKeys} passes verbatim (a non-string entry
+   * as null, which the verifier refuses as malformed). Absent both, the expectation carries none.
+   */
+  private static Expected withEnrolledDevices(Expected e, JsonNode expected, Map<String, JsonNode> keyById) {
+    List<String> keys = null;
+    if (expected.has("enrolledDeviceKeyIds")) {
+      keys = new ArrayList<>();
+      for (JsonNode id : expected.get("enrolledDeviceKeyIds")) keys.add(keyById.get(id.asText()).path("spkiB64").asText());
+    } else if (expected.has("enrolledDeviceKeys")) {
+      keys = new ArrayList<>();
+      for (JsonNode k : expected.get("enrolledDeviceKeys")) keys.add(k.isTextual() ? k.textValue() : null);
+    }
+    return keys == null ? e : e.withEnrolledDeviceKeys(keys);
   }
 
   private static void assertReason(JsonNode c, String reason) {
+    // `reason` is the exact refusal text every port must produce (the TS reference's).
+    if (c.has("reason")) {
+      org.junit.jupiter.api.Assertions.assertEquals(localized(c.path("reason").asText()), reason,
+          c.path("name").asText() + ": exact reason");
+    }
     if (!c.has("reasonIncludes")) return;
-    String fragment = c.path("reasonIncludes").asText();
+    String fragment = localized(c.path("reasonIncludes").asText());
     assertTrue(reason != null && reason.contains(fragment),
         c.path("name").asText() + ": reason \"" + reason + "\" does not contain \"" + fragment + "\"");
   }
@@ -110,7 +178,18 @@ final class SharedParityVectorsTest {
           entry.getValue().forEach(id -> keys.add(keyById.get(id.asText()).path(encoding).asText()));
           resolved.put(entry.getKey(), keys);
         });
-        anchor = ApproverTrustAnchor.ofDidsMultiKey(new ArrayList<>(resolved.keySet()), resolved::get);
+        // Harness instruction: the resolver throws for these DIDs.
+        List<String> throwsFor = new ArrayList<>();
+        expected.path("resolverThrowsFor").forEach(did -> throwsFor.add(did.asText()));
+        if (expected.path("resolverOmitted").asBoolean(false)) {
+          // Harness instruction: a DID-mode anchor with no resolver at all.
+          anchor = ApproverTrustAnchor.ofDids(new ArrayList<>(resolved.keySet()), null);
+        } else {
+          anchor = ApproverTrustAnchor.ofDidsMultiKey(new ArrayList<>(resolved.keySet()), did -> {
+            if (throwsFor.contains(did)) throw new IllegalStateException("resolver unavailable for " + did);
+            return resolved.get(did);
+          });
+        }
       } else {
         List<String> publicKeys = new ArrayList<>();
         // A WEBAUTHN witness verifies under the credential's COSE_Key; such cases say so explicitly.
@@ -120,7 +199,12 @@ final class SharedParityVectorsTest {
       }
       Map<String,Object> params = Records.JSON.convertValue(expected.path("params"), new com.fasterxml.jackson.core.type.TypeReference<Map<String,Object>>() {});
       Map<String,Object> agentContext = expected.has("agentContext") ? Records.JSON.convertValue(expected.path("agentContext"), new com.fasterxml.jackson.core.type.TypeReference<Map<String,Object>>() {}) : null;
+      if (floorRefusal(c, expected) != null) continue;
       Expected e = new Expected(expected.path("target").asText(), expected.path("nonce").asText(), expected.path("actionType").asText(), params, anchor, agentContext, floor(expected));
+      // expected.tenantId: absent means omitted.
+      if (expected.hasNonNull("tenantId")) e = e.withTenantId(expected.path("tenantId").asText());
+      if (expected.hasNonNull("requesterDid")) e = e.withRequesterDid(expected.path("requesterDid").asText());
+      e = withEnrolledDevices(e, expected, keyById);
       var result = Verify.verifyApprovalReceipt(ApprovalReceipt.parse(c.path("receipt")), e,
           options(merge(section.path("options"), c.get("options"))));
       assertEquals(c.path("ok").asBoolean(), result.ok(), c.path("name").asText() + ": " + result.reason());
@@ -159,6 +243,7 @@ final class SharedParityVectorsTest {
         merged.get("approverKeyIds").forEach(id -> publicKeys.add(keyById.get(id.asText()).path("spkiB64").asText()));
         anchor = ApproverTrustAnchor.ofPublicKeys(publicKeys);
       }
+      if (floorRefusal(c, merged) != null) continue;
       AgentAuthorityExpected expected = new AgentAuthorityExpected(anchor, merged.path("target").asText(), merged.path("agentDid").asText(), floor(merged));
       ObjectNode op = merge(section.path("options"), c.get("options"));
       if (!op.has("clockSkewSeconds")) op.put("clockSkewSeconds", 30);
@@ -173,6 +258,104 @@ final class SharedParityVectorsTest {
           c.get("actionPatterns").forEach(p -> want.add(p.asText()));
           assertEquals(want, result.authority().actionPatterns(), c.path("name").asText() + " actionPatterns");
         }
+      }
+    }
+  }
+
+  /** The standalone WebAuthn witness cases (absent witness/expectation fields are omitted). */
+  @Test void webauthnWitnessVectors() {
+    JsonNode section = load().path("webauthnWitness");
+    assertTrue(section.path("cases").size() > 0, "webauthnWitness section has no cases");
+    for (JsonNode c : section.path("cases")) {
+      JsonNode w = c.path("witness");
+      java.util.function.Function<String, String> text = f -> w.hasNonNull(f) && w.get(f).isTextual() ? w.get(f).asText() : null;
+      WebAuthnWitness witness = c.has("witness") && w.isObject()
+          ? new WebAuthnWitness(text.apply("signedPayload"), text.apply("publicKey"),
+              text.apply("authenticatorData"), text.apply("clientDataJSON"), text.apply("signature"))
+          : null;
+      WebAuthnWitnessExpectation expectation = null;
+      JsonNode e = c.path("expectation");
+      if (e.isObject()) {
+        List<String> origins = null;
+        JsonNode o = e.get("expectedOrigin");
+        if (o != null && o.isTextual()) origins = List.of(o.asText());
+        else if (o != null && o.isArray()) {
+          origins = new ArrayList<>();
+          for (JsonNode x : o) origins.add(x.isTextual() ? x.asText() : null);
+        }
+        expectation = new WebAuthnWitnessExpectation(origins,
+            e.hasNonNull("expectedRpId") ? e.get("expectedRpId").asText() : null,
+            e.has("requireUserVerification") ? e.get("requireUserVerification").asBoolean() : null,
+            e.path("allowCrossOrigin").asBoolean(false));
+      }
+      VerifyResult result = Verify.verifyWebAuthnWitness(witness, expectation);
+      String name = c.path("name").asText();
+      assertEquals(c.path("ok").asBoolean(), result.ok(), name + ": " + result.reason());
+      assertReason(c, result.reason());
+      if (c.has("reasonPrefix")) {
+        String prefix = localized(c.path("reasonPrefix").asText());
+        assertTrue(result.reason() != null && result.reason().startsWith(prefix),
+            name + ": reason \"" + result.reason() + "\" lacks prefix \"" + prefix + "\"");
+      }
+    }
+  }
+
+  /** The shared delegation (seal) cases: DID-mode anchor over expected.approverDids. */
+  @Test void delegationVectors() {
+    JsonNode v = load();
+    Map<String,JsonNode> keyById = new HashMap<>();
+    for (JsonNode k : v.path("keys")) keyById.put(k.path("id").asText(), k);
+    runDelegationCases(v.path("delegation"), keyById);
+  }
+
+  /**
+   * DIV §4.3.2 enrolled approver devices: the enrolledDevice section with its own keys, through the
+   * same approval, delegation and agent-authority harnesses (verifier-parity-vectors.test.ts).
+   */
+  @Test void enrolledDeviceVectors() {
+    JsonNode section = load().path("enrolledDevice");
+    for (String part : List.of("approvals", "delegation", "agentAuthority"))
+      assertTrue(section.path(part).path("cases").size() > 0, "enrolledDevice." + part + " has no cases");
+    Map<String,JsonNode> own = new HashMap<>();
+    for (JsonNode k : section.path("keys")) own.put(k.path("id").asText(), k);
+    assertFalse(own.isEmpty(), "enrolledDevice section has no keys");
+    runApprovalCases(section.path("approvals"), own);
+    runDelegationCases(section.path("delegation"), own);
+    runAuthorityCases(section.path("agentAuthority"), own);
+  }
+
+  private static void runDelegationCases(JsonNode section, Map<String,JsonNode> keyById) {
+    assertTrue(section.path("cases").size() > 0, "delegation section has no cases");
+    for (JsonNode c : section.path("cases")) {
+      ObjectNode expected = section.path("expected").deepCopy();
+      if (c.has("expected")) expected.setAll((ObjectNode) c.get("expected"));
+      Map<String, List<String>> ids = new HashMap<>();
+      expected.path("approverDids").fields().forEachRemaining(x -> {
+        List<String> ks = new ArrayList<>();
+        x.getValue().forEach(z -> ks.add(keyById.get(z.asText()).path("spkiB64").asText()));
+        ids.put(x.getKey(), ks);
+      });
+      ApproverTrustAnchor anchor = ApproverTrustAnchor.ofDidsMultiKey(new ArrayList<>(ids.keySet()), ids::get);
+      Map<String,Object> params = Records.JSON.convertValue(expected.path("params"), new com.fasterxml.jackson.core.type.TypeReference<Map<String,Object>>() {});
+      if (floorRefusal(c, expected) != null) continue;
+      Expected e = new Expected(expected.path("target").asText(), null, expected.path("actionType").asText(), params, anchor, null, floor(expected));
+      if (expected.hasNonNull("tenantId")) e = e.withTenantId(expected.path("tenantId").asText());
+      if (expected.hasNonNull("requesterDid")) e = e.withRequesterDid(expected.path("requesterDid").asText());
+      DelegationVerification result = Verify.verifyDelegation(ApprovalReceipt.parse(c.path("receipt")), e,
+          options(merge(section.path("options"), c.get("options"))));
+      String name = c.path("name").asText();
+      assertEquals(c.path("ok").asBoolean(), result.result().ok(), name + ": " + result.result().reason());
+      assertReason(c, result.result().reason());
+      if (c.has("signers") || c.has("delegatedTo") || c.has("delegatedQuorum")) {
+        assertNotNull(result.delegation(), name + ": no verified delegation to inspect");
+        assertSigners(c, result.delegation().signers());
+        if (c.has("delegatedTo")) {
+          List<String> want = new ArrayList<>();
+          c.get("delegatedTo").forEach(d -> want.add(d.asText()));
+          assertEquals(want, result.delegation().delegatedTo(), name + " delegatedTo");
+        }
+        if (c.has("delegatedQuorum"))
+          assertEquals(c.get("delegatedQuorum").asInt(), result.delegation().delegatedQuorum(), name + " delegatedQuorum");
       }
     }
   }
@@ -332,6 +515,8 @@ final class SharedParityVectorsTest {
           o.has("maxWindowSeconds") ? o.path("maxWindowSeconds").asLong() : null);
       var r = Dewp.verifyEvidenceBundle(Dewp.EvidenceBundle.parse(c.path("bundle")), opts);
       assertEquals(c.path("ok").asBoolean(), r.ok(), name + " " + r.failed());
+      if (c.has("contentVerified")) assertEquals(c.path("contentVerified").asInt(), r.contentVerified(), name + " contentVerified");
+      if (c.has("commitmentOnly")) assertEquals(c.path("commitmentOnly").asInt(), r.commitmentOnly(), name + " commitmentOnly");
       Map<String, String> byNonce = new HashMap<>();
       r.execution().byNonce().forEach((n, v) -> byNonce.put(n, v.status()));
       Map<String, String> wantByNonce = new HashMap<>();

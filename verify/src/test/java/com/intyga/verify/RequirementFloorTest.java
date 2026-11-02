@@ -1,5 +1,6 @@
 package com.intyga.verify;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -92,5 +93,53 @@ class RequirementFloorTest {
         new AgentAuthorityExpected(anchor, "prod", "did:ex:agent", RequirementFloor.ofQuorum(2)), VerifyOptions.defaults());
     assertFalse(ar.ok());
     assertTrue(ar.reason().contains(RequirementFloor.WEAKER_REASON), ar.reason());
+  }
+
+  @Test void explicitAndCredentialIssuerSignersNeverCountButLegacyRequesterStillDoes() throws Exception {
+    KeyPair alice = keyPair(); KeyPair bob = keyPair();
+    Map<String, String> keys = Map.of("did:ex:alice", spki(alice), "did:ex:bob", spki(bob));
+    ApproverTrustAnchor anchor = ApproverTrustAnchor.ofDids(List.copyOf(keys.keySet()), keys::get);
+    Map<String, Object> params = Map.of();
+    for (int i = 0; i < 2; i++) {
+      RequesterIdentity requester = i == 0 ? new RequesterIdentity("did:ex:alice", null)
+          : new RequesterIdentity("did:ex:alice", null, "did:ex:bob");
+      ApprovalRequirement requirement = i == 0
+          ? new ApprovalRequirement(1, false, List.of(), false, "human", List.of("did:ex:bob"))
+          : new ApprovalRequirement(1, false, List.of(), true, "human");
+      String canonical = Canonical.canonicalIntentPayload("prod", "deploy", "Deploy", params,
+          requester, requirement, "n", "2999-01-01T00:00:00.000Z");
+      ApprovalReceipt proof = receipt(canonical, "Deploy", params, requester, Map.of("did:ex:bob", bob));
+      VerifyResult result = Verify.verifyApprovalReceipt(proof,
+          new Expected("prod", "n", "deploy", params, anchor), VerifyOptions.defaults());
+      assertFalse(result.ok(), result.reason());
+    }
+    RequesterIdentity requester = new RequesterIdentity("did:ex:alice", null);
+    ApprovalRequirement legacy = new ApprovalRequirement(1, false, List.of(), false, "human");
+    String canonical = Canonical.canonicalIntentPayload("prod", "deploy", "Deploy", params,
+        requester, legacy, "legacy", "2999-01-01T00:00:00.000Z");
+    assertTrue(Verify.verifyApprovalReceipt(
+        receipt(canonical, "Deploy", params, requester, Map.of("did:ex:alice", alice)),
+        new Expected("prod", "legacy", "deploy", params, anchor), VerifyOptions.defaults()).ok());
+  }
+
+  @Test void excludedIdentityTaintsAnAliasUnderAnEligibleDid() throws Exception {
+    KeyPair alice = keyPair();
+    RequesterIdentity requester = new RequesterIdentity("did:ex:requester", null);
+    ApprovalRequirement requirement = new ApprovalRequirement(
+        1, false, List.of(), false, "human", List.of("did:ex:alice"));
+    String canonical = Canonical.canonicalIntentPayload("prod", "deploy", "Deploy", Map.of(),
+        requester, requirement, "alias", "2999-01-01T00:00:00.000Z");
+    ApprovalReceipt proof = receipt(canonical, "Deploy", Map.of(), requester,
+        Map.of("did:ex:bob", alice));
+    ApproverTrustAnchor anchor = ApproverTrustAnchor.ofDids(
+        List.of("did:ex:bob"), did -> did.equals("did:ex:alice") || did.equals("did:ex:bob")
+            ? spki(alice) : null);
+    VerifyResult result = Verify.verifyApprovalReceipt(proof,
+        new Expected("prod", "alias", "deploy", Map.of(), anchor), VerifyOptions.defaults());
+    assertFalse(result.ok(), result.reason());
+    // The reference's text: the alias is reported as a key already counted for the excluded identity.
+    assertEquals("quorum not met: 0 of 1 required approver signatures verified (signer did:ex:bob"
+        + " verified under a key already counted for excluded identity did:ex:alice; two approver"
+        + " identities sharing one key count once (DIV §4.4.6))", result.reason());
   }
 }

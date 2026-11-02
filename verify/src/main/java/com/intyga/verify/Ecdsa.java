@@ -95,6 +95,18 @@ final class Ecdsa {
    * IEEE-P1363 (r‖s) encodings — matching every other port.
    */
   static boolean verifySignature(ECPublicKey pub, byte[] message, byte[] sig) {
+    return verifySignature(pub, message, sig, true);
+  }
+
+  /**
+   * A WebAuthn assertion signature is ASN.1 DER only (WebAuthn §6.5.6); a raw r‖s encoding is
+   * refused there, as in every other port. Bare-key ES256 witnesses keep accepting both.
+   */
+  static boolean verifyDerSignature(ECPublicKey pub, byte[] message, byte[] sig) {
+    return verifySignature(pub, message, sig, false);
+  }
+
+  private static boolean verifySignature(ECPublicKey pub, byte[] message, byte[] sig, boolean allowP1363) {
     // Range-check r and s HERE rather than trusting the platform provider to do it. On JDK 15-18
     // before 17.0.3 (CVE-2022-21449) an all-zero ECDSA signature verifies under ANY key, and this
     // library is the thing that refuses unapproved actions — a relying party's patch level is not
@@ -116,7 +128,7 @@ final class Ecdsa {
     } catch (GeneralSecurityException e) {
       return false;
     }
-    if (sig.length == 64) {
+    if (allowP1363 && sig.length == 64) {
       try {
         Signature verifier = Signature.getInstance("SHA256withECDSAinP1363Format");
         verifier.initVerify(pub);

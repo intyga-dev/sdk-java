@@ -1,5 +1,6 @@
 package com.intyga.sdk;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -62,7 +63,7 @@ final class TrustBundleTenantBindingTest {
       if (tenant == null) payload.remove("tenantId"); else payload.set("tenantId", tenant);
       TrustBundleResult result = TrustBundle.verify(token(payload, pair), jwk, Instant.parse("2026-10-10T12:00:00Z"));
       assertFalse(result.ok());
-      assertTrue(result.reason().contains("non-empty tenantId"), result.reason());
+      assertEquals("trust bundle tenantId must be a non-empty string", result.reason());
     }
   }
 }

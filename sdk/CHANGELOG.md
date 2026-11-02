@@ -3,8 +3,63 @@
 All notable changes to `com.intyga:intyga-sdk` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [2.3.0]
 
+- DIV §4.3.2 / §5a.4 "Enrolled approver devices" (targets DIV 1.3.0). `TrustBundle.verify` accepts
+  `v: 2` exactly when some policy entry carries `requireEnrolledDevice: true` (otherwise
+  "unsupported trust bundle type or version"); an entry may carry the field only in a version 2
+  bundle and only as `true` ("trust bundle carries invalid or incomplete policy"). New
+  `BundlePolicy.requireEnrolledDevice()` and `BundlePolicy.fromJson(entry, version)`; `fromJson(entry)`
+  reads a version 1 entry. `requirementFor` resolves version 1 and 2 bundles and carries the field
+  into the returned requirement.
+- `createOfflineChallenge` refuses such a rule after the hardware refusal: `"<actionType>" requires
+  an enrolled approver device, which cannot sign offline — this action cannot be approved out of band
+  (DIV §5a.3)`. A delegation is always weaker than an ordinary rule that requires one, and the
+  requirement floor built from a bundle rule carries it. `decodeChallengeEnvelope` keeps a signed
+  `requireEnrolledDevice`, so an envelope carrying it is refused as the reference refuses it.
+- `ApprovalPolicy.lostApprovalConstraints` treats `requireEnrolledDevice` like `requireHardwareKey`,
+  and an auto-approving rule must match it exactly. `ApprovalPolicy.Rule.requireEnrolledDevice()`
+  defaults to false.
+- `TrustAnchorFile` gains `enrolledDeviceKeys()` (online anchors only; never null, empty when the file
+  names none — the reference's `trustAnchorEnrolledDeviceKeys`), with the reference's refusal texts.
+  The six- and seven-argument constructors are kept.
+- `ApprovalGuard.Builder.enrolledDeviceKeys(List<String>)`: optional RP-owned enrolled approver
+  device keys, passed to verification as `expected.enrolledDeviceKeys()`. A null or empty entry is
+  refused when the guard is built ("ApprovalGuard.enrolledDeviceKeys must be an array of non-empty
+  base64 keys"), as in the TypeScript guard; the guard's `RequirementFloor` accepts
+  `requireEnrolledDevice`. A receipt whose signed policy requires an enrolled device is refused
+  without the keys.
+- Depends on `intyga-verify` 2.3.0.
+- Pinned by the `bundle-v2-enrolled-device-*` and `enrolled-device-*` cases of
+  `offline-approval-vectors.json`; the harness passes the new `bundleVersion` / `bundlePolicy` inputs.
+
+## [2.2.0]
+
+- Trust bundles accept repeated DIDs in `requesterControllers` and policy `excludedSignerDids`;
+  `requirementFor` returns policy exclusions sorted and deduplicated.
+- `requirementFor` refuses (empty) a `requesterCannotApprove` rule when no requester DID is given,
+  as for a missing controller entry or a malformed `requesterControllers` map (DIV §5a.4).
+- `TrustBundle.verify` matches the reference's check order and texts: `requesterControllers` is
+  checked right after `controllerKeys` ("trust bundle carries malformed requester controllers"),
+  the tenant reason reads "trust bundle tenantId must be a non-empty string", every JWS part is
+  decoded as strict base64url, a header or payload that is a JSON array is refused as invalid, the
+  `alg` is printed as JavaScript would, and the bundle age prints like `toFixed(1)` (it rounded the
+  shortest decimal before, so 30.15 days read 30.2).
+- `createOfflineChallenge`: new `ChallengeRequest.Builder.windowMinutes(Number)`; a window that is
+  not a whole number refuses at the reference's position. A delegation's quorum is checked before
+  its tenant ("delegation and trust bundle belong to different tenants"); the tenant refusal reads
+  as in the reference.
+- `decodeChallengeEnvelope` checks the payload version and tenant shape like the reference, keeps a
+  signed `requester.credentialIssuerDid` (such challenges were refused as non-canonical), and names
+  a non-string `type` as JavaScript would. `signChallengeEnvelope` refuses a legacy v1 challenge
+  before reading its expiry, with the reference's text.
+- `TrustAnchorFile.parse` reports JSON errors as "not valid JSON (<parser message>)" and checks
+  `tenantId` before `label`, as in the reference.
+- The offline vectors harness asserts every refusal's `reason` / `reasonPrefix`, after rewriting the
+  vectors' TypeScript API names to the Java ones in `api-name-hints.json`.
+- `decodeChallengeEnvelope` refuses a requirement without DIV §4.3.2 types (a fractional, string or
+  zero `requiredApprovals`, non-boolean flags, non-string AAGUIDs or signer class) with "challenge
+  payload requirement is not a valid approval requirement — refusing to sign it".
 ## [2.1.0]
 
 - `IntygaClient.reportDispatched` / `submitEvidence` (DEWP 1.1 §4.7) and

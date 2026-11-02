@@ -237,12 +237,56 @@ public final class Canonical {
   }
 
   /**
+   * Refuses malformed identity extensions (DIV §4.3.2) instead of building bytes with them, as the
+   * reference does ({@code NonCanonicalValue}): every verifier would refuse the resulting receipt.
+   */
+  static void requireValidIdentityExtensions(
+      RequesterIdentity requester, ApprovalRequirement requirement) {
+    if (requester.credentialIssuerDid() != null && !Verify.validDid(requester.credentialIssuerDid())) {
+      throw new NonPortableValueException("credentialIssuerDid must be a valid DID");
+    }
+    if (requirement.excludedSignerDids() != null) {
+      for (String did : requirement.excludedSignerDids()) {
+        if (!Verify.validDid(did)) {
+          throw new NonPortableValueException("excludedSignerDids must be a DID array");
+        }
+      }
+    }
+  }
+
+  /** DIV §4.3.2 builder refusals. Identical text in every port (verifier-parity-vectors.json). */
+  static final String ENROLLED_DEVICE_ORDINARY_ONLY =
+      "requireEnrolledDevice is defined only for ordinary approval intents (DIV §4.3.2)";
+  static final String ENROLLED_DEVICE_WITH_HARDWARE =
+      "requireEnrolledDevice cannot be combined with requireHardwareKey or allowedAaguids (DIV §4.3.2)";
+
+  /**
+   * Whether the optional {@code requireEnrolledDevice} member is signed — only when TRUE, and then as
+   * the literal {@code true}; null and FALSE omit it, so one policy has one encoding and every
+   * historical payload keeps its bytes. {@code ordinary} is true only for
+   * {@code div-intent-verification}: the offline, delegation and agent-authority builders refuse the
+   * field, and no builder signs it beside a hardware requirement, which no device key can meet.
+   *
+   * @throws NonPortableValueException for a combination DIV §4.3.2 forbids
+   */
+  static boolean enrolledDeviceField(ApprovalRequirement requirement, boolean ordinary) {
+    if (!requirement.requiresEnrolledDevice()) return false;
+    if (!ordinary) throw new NonPortableValueException(ENROLLED_DEVICE_ORDINARY_ONLY);
+    if (requirement.requiresHardwareCredential()) {
+      throw new NonPortableValueException(ENROLLED_DEVICE_WITH_HARDWARE);
+    }
+    return true;
+  }
+
+  /**
    * The requester + requirement projection shared by all three builders. One definition rather than
    * three copies: these bytes are the contract, and a field added to one builder but not the others
    * is exactly the drift the golden vectors exist to catch.
    */
   private static Map<String, Object>[] canonicalCommon(
-      RequesterIdentity requester, ApprovalRequirement requirement) {
+      RequesterIdentity requester, ApprovalRequirement requirement, boolean ordinary) {
+    requireValidIdentityExtensions(requester, requirement);
+    boolean enrolledDevice = enrolledDeviceField(requirement, ordinary);
     Map<String, Object> attestation = null;
     if (requester.attestation() != null) {
       attestation = new LinkedHashMap<>();
@@ -261,12 +305,21 @@ public final class Canonical {
     Map<String, Object> req = new LinkedHashMap<>();
     req.put("did", nz(requester.did()));
     req.put("attestation", attestation);
+    if (requester.credentialIssuerDid() != null) {
+      req.put("credentialIssuerDid", requester.credentialIssuerDid());
+    }
     Map<String, Object> rq = new LinkedHashMap<>();
     rq.put("requiredApprovals", requirement.requiredApprovals());
     rq.put("requireHardwareKey", requirement.requireHardwareKey());
     rq.put("allowedAaguids", aaguids);
     rq.put("requesterCannotApprove", requirement.requesterCannotApprove());
     rq.put("signerClass", nz(requirement.signerClass()));
+    if (requirement.excludedSignerDids() != null) {
+      List<String> excluded = new ArrayList<>(new java.util.LinkedHashSet<>(requirement.excludedSignerDids()));
+      excluded.sort(Canonical::compareSortable);
+      rq.put("excludedSignerDids", excluded);
+    }
+    if (enrolledDevice) rq.put("requireEnrolledDevice", true);
     @SuppressWarnings("unchecked")
     Map<String, Object>[] out = new Map[] {req, rq};
     return out;
@@ -316,7 +369,7 @@ public final class Canonical {
       String target, String actionType, String display, Map<String, Object> params,
       RequesterIdentity requester, ApprovalRequirement requirement, String nonce,
       String expiresAt, Map<String, Object> agentContext) {
-    Map<String, Object>[] common = canonicalCommon(requester, requirement);
+    Map<String, Object>[] common = canonicalCommon(requester, requirement, true);
     Map<String, Object> obj = new LinkedHashMap<>();
     obj.put("v", Div.VERSION);
     obj.put("type", Div.INTENT_TYPE);
@@ -359,7 +412,7 @@ public final class Canonical {
       String nonce,
       String challengedAt,
       String expiresAt) {
-    Map<String, Object>[] common = canonicalCommon(requester, requirement);
+    Map<String, Object>[] common = canonicalCommon(requester, requirement, false);
     Map<String, Object> obj = new LinkedHashMap<>();
     obj.put("v", Div.VERSION);
     obj.put("type", Div.OFFLINE_INTENT_TYPE);
@@ -406,7 +459,7 @@ public final class Canonical {
       String nonce,
       String sealedAt,
       String expiresAt) {
-    Map<String, Object>[] common = canonicalCommon(requester, requirement);
+    Map<String, Object>[] common = canonicalCommon(requester, requirement, false);
     List<String> delegates = delegatedTo == null ? new ArrayList<>() : new ArrayList<>(delegatedTo);
     delegates.sort(Canonical::compareSortable);
     Map<String, Object> obj = new LinkedHashMap<>();

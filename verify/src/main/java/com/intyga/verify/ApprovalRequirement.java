@@ -1,5 +1,7 @@
 package com.intyga.verify;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
 import java.util.List;
 
 /**
@@ -13,13 +15,39 @@ import java.util.List;
  * requireHardwareKey for bare-key and offline witnesses. signerClass is partially checkable — but the
  * verifier's own rule is absolute: refuse any value it does not recognize ("human" is the only
  * class defined today, DIV §4.3.2).
+ *
+ * <p>{@code requireEnrolledDevice} (DIV §4.3.2 "Enrolled approver devices") is {@code null} when
+ * absent — the only state that leaves every historical payload's bytes unchanged — and is signed
+ * only when {@code TRUE}, as the literal {@code true}. A receipt carrying any other value binds as
+ * {@code FALSE} and is refused as malformed; a builder given {@code FALSE} omits the field. It is
+ * defined for ordinary intents only, never with a hardware requirement.
  */
 public record ApprovalRequirement(
     int requiredApprovals,
     boolean requireHardwareKey,
     List<String> allowedAaguids,
     boolean requesterCannotApprove,
-    String signerClass) {
+    String signerClass,
+    // A present JSON null binds as [""], never null: see NullIsMalformed.
+    @JsonDeserialize(using = NullIsMalformed.DidList.class) List<String> excludedSignerDids,
+    // Absent → null, true → TRUE, any other present value → FALSE (malformed): see NullIsMalformed.
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    @JsonDeserialize(using = NullIsMalformed.EnrolledDevice.class) Boolean requireEnrolledDevice) {
+
+  /** Source-compatible constructor for pre-extension callers. */
+  public ApprovalRequirement(int requiredApprovals, boolean requireHardwareKey,
+      List<String> allowedAaguids, boolean requesterCannotApprove, String signerClass) {
+    this(requiredApprovals, requireHardwareKey, allowedAaguids, requesterCannotApprove,
+        signerClass, null, null);
+  }
+
+  /** Source-compatible constructor for callers predating {@code requireEnrolledDevice}. */
+  public ApprovalRequirement(int requiredApprovals, boolean requireHardwareKey,
+      List<String> allowedAaguids, boolean requesterCannotApprove, String signerClass,
+      List<String> excludedSignerDids) {
+    this(requiredApprovals, requireHardwareKey, allowedAaguids, requesterCannotApprove,
+        signerClass, excludedSignerDids, null);
+  }
 
   /**
    * requireHardwareKey, or a non-empty allowedAaguids model allowlist. A bare key satisfies neither
@@ -27,5 +55,10 @@ public record ApprovalRequirement(
    */
   public boolean requiresHardwareCredential() {
     return requireHardwareKey || (allowedAaguids != null && !allowedAaguids.isEmpty());
+  }
+
+  /** Whether the requirement demands an enrolled approver device ({@code requireEnrolledDevice} is TRUE). */
+  public boolean requiresEnrolledDevice() {
+    return Boolean.TRUE.equals(requireEnrolledDevice);
   }
 }

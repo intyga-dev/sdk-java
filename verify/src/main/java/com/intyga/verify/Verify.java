@@ -85,15 +85,15 @@ public final class Verify {
   }
 
   private static String tenantProblem(Integer version, String signedTenant, String expectedTenant) {
+    // Texts and order of the reference's checkTenantBinding.
     if (version != null && version == Div.VERSION)
-      return expectedTenant == null ? null : "legacy v1 receipt cannot satisfy an expected tenant";
-    if (version != null && version == Div.TENANT_VERSION) {
-      if (isEmpty(signedTenant)) return "v2 receipt is missing a non-empty tenantId";
-      if (isEmpty(expectedTenant)) return "v2 receipt requires a caller-supplied non-empty tenantId";
-      if (!signedTenant.equals(expectedTenant)) return "receipt is for a different tenant";
-      return null;
-    }
-    return "unsupported DIV payload version";
+      return expectedTenant == null ? null : "legacy DIV v1 payload cannot be verified with an expected tenantId";
+    if (version == null || version != Div.TENANT_VERSION)
+      return "unsupported DIV payload version (" + (version == null || version == 0 ? "unparseable" : version) + ")";
+    if (isEmpty(expectedTenant)) return "expected.tenantId() is required for tenant-bound DIV v2 payloads";
+    if (isEmpty(signedTenant)) return "tenant-bound DIV v2 payload is missing a non-empty tenantId";
+    if (!signedTenant.equals(expectedTenant)) return "receipt was signed for a different tenant";
+    return null;
   }
 
   /** Byte-identical DIV §5c canonical platform intent. */
@@ -137,6 +137,9 @@ public final class Verify {
       String target, List<String> actionPatterns, String display, String agentDid,
       RequesterIdentity requester, ApprovalRequirement requirement,
       String nonce, String sealedAt, String expiresAt, String parentReceiptHash) {
+    Canonical.requireValidIdentityExtensions(requester, requirement);
+    // DIV §4.3.2: this payload kind never carries requireEnrolledDevice (throws when it is TRUE).
+    Canonical.enrolledDeviceField(requirement, false);
     List<String> patterns = new ArrayList<>(actionPatterns); Collections.sort(patterns);
     List<String> aaguids = new ArrayList<>(requirement.allowedAaguids()); Collections.sort(aaguids);
     Map<String, Object> req = new LinkedHashMap<>();
@@ -144,9 +147,14 @@ public final class Verify {
     req.put("requireHardwareKey", requirement.requireHardwareKey());
     req.put("allowedAaguids", aaguids); req.put("requesterCannotApprove", requirement.requesterCannotApprove());
     req.put("signerClass", requirement.signerClass());
+    if (requirement.excludedSignerDids() != null) {
+      List<String> excluded = new ArrayList<>(new LinkedHashSet<>(requirement.excludedSignerDids()));
+      Collections.sort(excluded); req.put("excludedSignerDids", excluded);
+    }
     Map<String, Object> requesterMap = new LinkedHashMap<>(); requesterMap.put("did", requester.did());
     RequesterAttestation a = requester.attestation();
     requesterMap.put("attestation", a == null ? null : Map.of("method", a.method(), "issuer", a.issuer(), "subject", a.subject()));
+    if (requester.credentialIssuerDid() != null) requesterMap.put("credentialIssuerDid", requester.credentialIssuerDid());
     Map<String, Object> m = new LinkedHashMap<>();
     m.put("v", Div.VERSION); m.put("type", Div.AGENT_AUTHORITY_TYPE); m.put("target", target);
     m.put("actionPatterns", patterns); m.put("display", display); m.put("agent", Map.of("did", agentDid));
@@ -166,11 +174,14 @@ public final class Verify {
     }
   }
 
+  /** TS reads an empty, non-JSON or wrongly typed payload as version 0 (checkTenantBinding). */
+  private static final String UNPARSEABLE_PAYLOAD_REASON = "unsupported DIV payload version (unparseable)";
+
   private static PlatformVerification verifyPlatformReceiptChecked(
       PlatformReceipt receipt, PlatformExpected expected, VerifyOptions opts) {
     com.fasterxml.jackson.databind.JsonNode p;
     try { p = Records.JSON.readTree(receipt.canonicalPayload()); }
-    catch (Exception e) { return PlatformVerification.refuse("canonicalPayload is not valid JSON"); }
+    catch (Exception e) { return PlatformVerification.refuse(UNPARSEABLE_PAYLOAD_REASON); }
     String tenantProblem = tenantProblem(p.path("v").isInt() ? p.path("v").asInt() : null,
         p.path("tenantId").isTextual() ? p.path("tenantId").asText() : null,
         expected == null ? null : expected.tenantId());
@@ -178,17 +189,21 @@ public final class Verify {
     String type = p.path("type").asText("");
     if (!Div.PLATFORM_INTENT_TYPE.equals(type)) {
       return PlatformVerification.refuse(Div.INTENT_TYPE.equals(type) || Div.OFFLINE_INTENT_TYPE.equals(type)
-          ? "this is an ordinary approval receipt — verify it with verifyApprovalReceipt"
+          ? "this is an ordinary approval receipt — verify it with Verify.verifyApprovalReceipt"
           : "payload is not a div-platform-intent");
     }
-    if (expected == null || expected.approvers() == null) return PlatformVerification.refuse("expected.approvers is required");
-    if (isEmpty(expected.nonce())) return PlatformVerification.refuse("expected.nonce is required");
+    // The reference's order: the nonce binding, then the caller's own trust inputs.
+    if (expected == null || isEmpty(expected.nonce()))
+      return PlatformVerification.refuse("expected.nonce() is required — it must be the challenge YOU issued (DIV §5 step 10)");
     if (!p.path("nonce").asText("").equals(expected.nonce())) return PlatformVerification.refuse("receipt is for a different challenge");
+    if (expected.approvers() == null) return PlatformVerification.refuse(
+        "expected.approvers() is required — the subject's key MUST come from your own trust policy, never from the receipt (DIV Invariant 3)");
     if (expected.payloadHash() == null || !expected.payloadHash().matches("[0-9a-f]{64}"))
-      return PlatformVerification.refuse("expected.payloadHash must be the 64-character lowercase hex SHA-256 you recomputed yourself");
-    if (isEmpty(expected.rpId())) return PlatformVerification.refuse("expected.rpId is required");
+      return PlatformVerification.refuse("expected.payloadHash() must be the 64-character lowercase hex SHA-256 you recomputed yourself");
+    if (isEmpty(expected.rpId())) return PlatformVerification.refuse(
+        "expected.rpId() is required — it must be YOUR registered RP ID, asserted independently of the receipt");
     if (opts.expectedRpId() != null && !opts.expectedRpId().equals(expected.rpId()))
-      return PlatformVerification.refuse("opts.expectedRpId conflicts with expected.rpId — pass the RP ID once");
+      return PlatformVerification.refuse("VerifyOptions.expectedRpId() conflicts with expected.rpId() — pass the RP ID once");
     String signedAt = p.path("signedAt").asText(""); String expiresAt = p.path("expiresAt").asText("");
     String subject = p.path("subject").path("externalId").asText("");
     if (isEmpty(signedAt)) return PlatformVerification.refuse("receipt missing signedAt");
@@ -196,7 +211,12 @@ public final class Verify {
     if (isEmpty(subject)) return PlatformVerification.refuse("receipt missing subject.externalId");
     if (expected.subjectExternalId() != null && !expected.subjectExternalId().equals(subject))
       return PlatformVerification.refuse("receipt was signed by a different subject");
-    String canonical = Canonical.withTenant(canonicalPlatformIntentPayload(expected.payloadHash(), expected.rpId(), subject, signedAt, expiresAt, expected.nonce()), expected.tenantId());
+    String canonical;
+    try {
+      canonical = Canonical.withTenant(canonicalPlatformIntentPayload(expected.payloadHash(), expected.rpId(), subject, signedAt, expiresAt, expected.nonce()), expected.tenantId());
+    } catch (Canonical.NonPortableValueException e) {
+      return PlatformVerification.refuse("platform payload is not canonicalizable: " + e.getMessage());
+    }
     if (!canonical.equals(receipt.canonicalPayload())) return PlatformVerification.refuse("payloadHash/rpId do not match what was signed");
     Instant signed; Instant expiry;
     try { signed = SignedTime.parse(signedAt).toInstant(); } catch (Exception e) { return PlatformVerification.refuse("signedAt is not a valid RFC3339 timestamp"); }
@@ -205,14 +225,14 @@ public final class Verify {
     Instant now = opts.asOf() == null ? Instant.now() : opts.asOf();
     long skew = opts.clockSkewSeconds() == null ? Div.DEFAULT_CLOCK_SKEW_SECONDS : opts.clockSkewSeconds();
     if (signed.isAfter(now.plusSeconds(skew))) return PlatformVerification.refuse("receipt is signed in the future (DIV §5c.3)");
-    if (!opts.allowExpired() && now.isAfter(expiry.plusSeconds(skew))) return PlatformVerification.refuse("proof has expired");
-    if ("AUTO_APPROVED".equals(receipt.sigAlg())) return PlatformVerification.refuse("a platform receipt cannot be auto-approved");
+    if (!opts.allowExpired() && now.isAfter(expiry.plusSeconds(skew))) return PlatformVerification.refuse("proof has expired (pass VerifyOptions.builder().allowExpired(true) for audit re-verification)");
+    if ("AUTO_APPROVED".equals(receipt.sigAlg())) return PlatformVerification.refuse("a platform receipt cannot be auto-approved — there is no signature to verify");
     ApprovalReceipt ar = new ApprovalReceipt(receipt.canonicalPayload(), null, null, "", Map.of(), receipt.signatures(),
         receipt.signerDid(), receipt.signerPublicKey(), receipt.signature(), receipt.sigAlg(), receipt.authenticatorData(),
         receipt.clientDataJSON(), null, receipt.verificationCode());
     List<ApprovalWitness> ws = witnessesOf(ar);
     if (ws.isEmpty()) return PlatformVerification.refuse("receipt missing signature material");
-    if (ws.size() > Div.MAX_WITNESSES) return PlatformVerification.refuse("receipt carries too many witnesses");
+    if (ws.size() > Div.MAX_WITNESSES) return PlatformVerification.refuse("receipt carries " + ws.size() + " witnesses, above the " + Div.MAX_WITNESSES + " this verifier will process");
     VerifyOptions effective = VerifyOptions.builder().expectedOrigin(opts.expectedOrigin()).expectedRpId(expected.rpId())
         // User verification is UNCONDITIONAL on this plane (DIV §5c.3): the ordinary-receipt waiver
         // requireUserVerification(false) is overridden here, never honoured.
@@ -239,6 +259,26 @@ public final class Verify {
     return new PlatformVerification(true, null, signers);
   }
 
+  /**
+   * Verifies one stored WebAuthn assertion on its own (the reference's {@code verifyWebAuthnWitness}):
+   * the expectations first (fail closed without an origin and RP ID), then every witness field, then
+   * the same assertion check the receipt path runs — ceremony type, origin, cross-origin frame,
+   * challenge = base64url(signedPayload), RP ID hash, UP/UV flags and the DER ECDSA signature over
+   * authenticatorData ‖ SHA-256(clientDataJSON) under {@code witness.publicKey()}, which must come
+   * from YOUR record of the credential. Never throws: hostile input is a refusal.
+   *
+   * @return accepted with no signers, or refused with the reason
+   */
+  public static VerifyResult verifyWebAuthnWitness(WebAuthnWitness witness, WebAuthnWitnessExpectation expectation) {
+    String problem;
+    try {
+      problem = WebAuthnSupport.verifyStandaloneWitness(witness, expectation);
+    } catch (RuntimeException e) {
+      problem = "WebAuthn verification failed: " + e.getClass().getSimpleName();
+    }
+    return problem.isEmpty() ? VerifyResult.accept(List.of()) : VerifyResult.refuse(problem);
+  }
+
   /** Verify a quorum-sealed DIV §5b authority. It never verifies as an approval. */
   public static AgentAuthorityVerification verifyAgentAuthority(
       ApprovalReceipt receipt, AgentAuthorityExpected expected, VerifyOptions opts) {
@@ -253,66 +293,91 @@ public final class Verify {
       ApprovalReceipt receipt, AgentAuthorityExpected expected, VerifyOptions opts) {
     com.fasterxml.jackson.databind.JsonNode p;
     try { p = Records.JSON.readTree(receipt.canonicalPayload()); }
-    catch (Exception e) { return AgentAuthorityVerification.refuse("canonicalPayload is not valid JSON"); }
+    catch (Exception e) { return AgentAuthorityVerification.refuse(UNPARSEABLE_PAYLOAD_REASON); }
     String tenantProblem = tenantProblem(p.path("v").isInt() ? p.path("v").asInt() : null,
         p.path("tenantId").isTextual() ? p.path("tenantId").asText() : null,
         expected == null ? null : expected.tenantId());
     if (tenantProblem != null) return AgentAuthorityVerification.refuse(tenantProblem);
     if (!Div.AGENT_AUTHORITY_TYPE.equals(p.path("type").asText())) return AgentAuthorityVerification.refuse("payload is not a div-agent-authority");
+    // The reference's check order and texts (verifyAgentAuthority in @intyga/verify).
+    com.fasterxml.jackson.databind.JsonNode parentNode = p.get("parentReceiptHash");
+    String parentReceiptHash = null;
+    if (parentNode == null || !parentNode.isNull()) {
+      if (parentNode == null || !parentNode.isTextual() || !parentNode.asText().matches("sha256:[0-9a-f]{64}"))
+        return AgentAuthorityVerification.refuse("authority is missing a valid parent receipt commitment");
+      parentReceiptHash = parentNode.asText();
+    }
     List<String> patterns = new ArrayList<>();
     if (!p.path("actionPatterns").isArray()) return AgentAuthorityVerification.refuse("authority is missing a valid actionPatterns set");
     for (com.fasterxml.jackson.databind.JsonNode n : p.path("actionPatterns")) { if (!n.isTextual() || n.asText().isEmpty()) return AgentAuthorityVerification.refuse("authority is missing a valid actionPatterns set"); patterns.add(n.asText()); }
     if (patterns.isEmpty()) return AgentAuthorityVerification.refuse("authority is missing a valid actionPatterns set");
-    com.fasterxml.jackson.databind.JsonNode parentNode = p.get("parentReceiptHash");
-    if (parentNode == null) return AgentAuthorityVerification.refuse("authority is missing parentReceiptHash");
-    String parentReceiptHash = null;
-    if (!parentNode.isNull()) {
-      if (!parentNode.isTextual() || !parentNode.asText().matches("sha256:[0-9a-f]{64}"))
-        return AgentAuthorityVerification.refuse("authority has invalid parentReceiptHash");
-      parentReceiptHash = parentNode.asText();
-    }
-    String sealedAt = p.path("sealedAt").asText(""); String expiresAt = p.path("expiresAt").asText(""); String nonce = p.path("nonce").asText("");
+    String sealedAt = p.path("sealedAt").isTextual() ? p.path("sealedAt").asText() : "";
+    String expiresAt = p.path("expiresAt").isTextual() ? p.path("expiresAt").asText() : "";
+    String nonce = p.path("nonce").asText("");
+    if (sealedAt.isEmpty()) return AgentAuthorityVerification.refuse("authority is missing sealedAt");
+    if (expiresAt.isEmpty()) return AgentAuthorityVerification.refuse("authority is missing expiresAt");
     Instant sealed; Instant expiry;
     try { sealed = SignedTime.parse(sealedAt).toInstant(); } catch (Exception e) { return AgentAuthorityVerification.refuse("sealedAt is not a valid RFC3339 timestamp"); }
     try { expiry = SignedTime.parse(expiresAt).toInstant(); } catch (Exception e) { return AgentAuthorityVerification.refuse("expiresAt is not a valid RFC3339 timestamp"); }
     if (expiry.isBefore(sealed)) return AgentAuthorityVerification.refuse("authority expires before it was sealed");
     Instant now = opts.asOf() == null ? Instant.now() : opts.asOf(); long skew = opts.clockSkewSeconds() == null ? Div.DEFAULT_CLOCK_SKEW_SECONDS : opts.clockSkewSeconds();
     if (sealed.isAfter(now.plusSeconds(skew))) return AgentAuthorityVerification.refuse("authority is sealed in the future (DIV §5b.2)");
-    if (!opts.allowExpired() && now.isAfter(expiry.plusSeconds(skew))) return AgentAuthorityVerification.refuse("authority has expired");
     if (receipt.requester() == null) return AgentAuthorityVerification.refuse("authority missing requester");
     ApprovalRequirement requirement;
-    try { requirement = Records.JSON.treeToValue(p.path("requirement"), ApprovalRequirement.class); }
-    catch (Exception e) { return AgentAuthorityVerification.refuse("authority payload is missing the signed approval requirement"); }
-    if (requirement == null || requirement.requiredApprovals() < 1) return AgentAuthorityVerification.refuse(INVALID_QUORUM_REASON);
+    try { requirement = p.path("requirement").path("requiredApprovals").isNumber()
+        ? Records.JSON.treeToValue(p.path("requirement"), ApprovalRequirement.class) : null; }
+    catch (Exception e) { requirement = null; }
+    if (requirement == null) return AgentAuthorityVerification.refuse("authority payload is missing the signed approval requirement");
+    if (requirement.requiredApprovals() < 1) return AgentAuthorityVerification.refuse(INVALID_QUORUM_REASON);
+    String extensionProblem = checkIdentityExtensions(receipt.requester(), requirement);
+    if (extensionProblem != null) return AgentAuthorityVerification.refuse(extensionProblem);
     String classProblem = checkSignerClass(requirement); if (classProblem != null) return AgentAuthorityVerification.refuse(classProblem);
+    // DIV §5 step 3e: this payload kind can never carry requireEnrolledDevice.
+    String deviceStructure = enrolledDeviceStructureProblem(requirement, false);
+    if (deviceStructure != null) return AgentAuthorityVerification.refuse(deviceStructure);
     String floorProblem = expected == null ? null : RequirementFloor.problem(requirement, expected.requirement());
     if (floorProblem != null) return AgentAuthorityVerification.refuse(floorProblem);
-    if (expected == null || isEmpty(expected.target()) || isEmpty(expected.agentDid()) || expected.approvers() == null)
-      return AgentAuthorityVerification.refuse("expected target, agentDid and approvers are required");
-    String rebuilt = Canonical.withTenant(canonicalAgentAuthorityPayload(expected.target(), patterns, receipt.actionDescription(), expected.agentDid(), receipt.requester(), requirement, nonce, sealedAt, expiresAt, parentReceiptHash), expected.tenantId());
+    if (expected == null || isEmpty(expected.target()))
+      return AgentAuthorityVerification.refuse("expected.target() is required — it must be YOUR target identifier, asserted independently of the authority (DIV Target Isolation)");
+    if (isEmpty(expected.agentDid()))
+      return AgentAuthorityVerification.refuse("expected.agentDid() is required — name the agent whose authority you are checking");
+    if (expected.approvers() == null)
+      return AgentAuthorityVerification.refuse("expected.approvers() is required — the sealing approvers MUST come from your own trust policy, never from the artifact (DIV Invariant 3)");
+    String rebuilt;
+    try {
+      rebuilt = Canonical.withTenant(canonicalAgentAuthorityPayload(expected.target(), patterns, receipt.actionDescription(), expected.agentDid(), receipt.requester(), requirement, nonce, sealedAt, expiresAt, parentReceiptHash), expected.tenantId());
+    } catch (Canonical.NonPortableValueException e) {
+      return AgentAuthorityVerification.refuse("authority payload is not canonicalizable: " + e.getMessage());
+    }
     if (!rebuilt.equals(receipt.canonicalPayload())) return AgentAuthorityVerification.refuse("target/agent/actionPatterns do not match what was sealed");
-    if ("AUTO_APPROVED".equals(receipt.sigAlg())) return AgentAuthorityVerification.refuse("an agent authority cannot be auto-approved");
+    if (!opts.allowExpired() && now.isAfter(expiry.plusSeconds(skew))) return AgentAuthorityVerification.refuse("authority has expired (pass VerifyOptions.builder().allowExpired(true) for audit re-verification)");
+    if ("AUTO_APPROVED".equals(receipt.sigAlg())) return AgentAuthorityVerification.refuse("an agent authority cannot be auto-approved — granting agent scope requires human signatures");
     List<ApprovalWitness> ws = witnessesOf(receipt); if (ws.isEmpty()) return AgentAuthorityVerification.refuse("authority missing signature material");
-    if (ws.size() > Div.MAX_WITNESSES) return AgentAuthorityVerification.refuse("authority carries too many witnesses");
+    if (ws.size() > Div.MAX_WITNESSES) return AgentAuthorityVerification.refuse("authority carries " + ws.size() + " witnesses, above the " + Div.MAX_WITNESSES + " this verifier will process");
     if (requirement.requiredApprovals() > 1 && expected.approvers().isKeySetMode())
       return AgentAuthorityVerification.refuse("multi-approver quorum requires a DID-mode trust anchor (DIV §5 step 3b)");
-    if (requirement.requesterCannotApprove() && expected.approvers().isKeySetMode())
-      return AgentAuthorityVerification.refuse("requesterCannotApprove requires a DID-mode trust anchor");
+    if ((requirement.requesterCannotApprove()
+        || (requirement.excludedSignerDids() != null && !requirement.excludedSignerDids().isEmpty()))
+        && expected.approvers().isKeySetMode())
+      return AgentAuthorityVerification.refuse("requesterCannotApprove requires a DID-mode trust anchor; key-only mode cannot authenticate requester identity");
     Set<String> verified = new LinkedHashSet<>(); Map<String, String> countedKeys = new LinkedHashMap<>(); List<String> failures = new ArrayList<>();
+    Set<String> excludedDids = excludedSignerDids(receipt.requester(), requirement);
+    String seedProblem = seedExcludedSigningKeys(countedKeys, expected.approvers(), excludedDids);
+    if (seedProblem != null) return AgentAuthorityVerification.refuse(seedProblem);
     for (ApprovalWitness w : ws) {
       ApproverTrustAnchor.Candidates cs = expected.approvers().candidatesRestricted(w.signerDid(), w.signerPublicKey(), null);
       if (cs.error() != null) { failures.add(cs.error()); continue; }
       String matched = null; String matchedKey = null; String last = "signature does not verify against any trusted approver key";
       for (ApproverTrustAnchor.Candidate c : cs.list()) { last = verifyWitness(w, c.key(), receipt, opts); if (last.isEmpty()) { matched = c.identity(); matchedKey = c.key(); break; } }
       if (matched == null) { failures.add(last); continue; }
-      if (requirement.requiresHardwareCredential() && !"WEBAUTHN".equals(w.sigAlg())) { failures.add("hardware-backed WebAuthn credential required"); continue; }
+      if (requirement.requiresHardwareCredential() && !"WEBAUTHN".equals(w.sigAlg())) { failures.add("signer " + w.signerDid() + " used a bare key, but the signed policy requires a hardware-backed WebAuthn credential"); continue; }
       if (requirement.requireHardwareKey()) { String synced = WebAuthnSupport.backupFlagsProblem(w); if (synced != null) { failures.add(synced); continue; } }
-      if (requirement.requesterCannotApprove() && Objects.equals(w.signerDid(), receipt.requester().did())) { failures.add("four-eyes: requester cannot seal their own authority"); continue; }
+      if (excludedDids.contains(w.signerDid())) { failures.add("four-eyes: requester " + w.signerDid() + " cannot seal their own request"); continue; }
       String shared = sharedKeyProblem(countedKeys, matchedKey, matched);
       if (shared != null) { failures.add(shared); continue; }
       verified.add(matched);
     }
-    if (verified.size() < requirement.requiredApprovals()) return AgentAuthorityVerification.refuse("authority quorum not met: " + verified.size() + " of " + requirement.requiredApprovals() + foldFailures(failures));
+    if (verified.size() < requirement.requiredApprovals()) return AgentAuthorityVerification.refuse("authority sealing quorum not met: " + verified.size() + " of " + requirement.requiredApprovals() + " required approver signatures verified" + foldFailures(failures));
     List<String> signers = new ArrayList<>(verified); Collections.sort(signers);
     List<String> scope = new ArrayList<>(new LinkedHashSet<>(patterns)); Collections.sort(scope);
     return new AgentAuthorityVerification(true, null, new VerifiedAgentAuthority(expected.agentDid(), expected.target(), scope, nonce, signers, sealedAt, expiresAt, parentReceiptHash, expected.tenantId()));
@@ -409,6 +474,17 @@ public final class Verify {
 
   /** One P-256 key maps to one identity even when serialized as COSE for one DID and SPKI for another. */
   static String sharedKeyProblem(Map<String, String> counted, String key, String identity) {
+    String fingerprint = keyFingerprint(key);
+    String owner = counted.get(fingerprint);
+    if (owner != null && !owner.equals(identity)) {
+      return "signer " + identity + " verified under a key already counted for " + owner
+          + "; two approver identities sharing one key count once (DIV §4.4.6)";
+    }
+    counted.put(fingerprint, identity);
+    return null;
+  }
+
+  private static String keyFingerprint(String key) {
     String fingerprint = key;
     try {
       String std = key.replace('-', '+').replace('_', '/').replace("=", "");
@@ -430,12 +506,33 @@ public final class Verify {
     } catch (IllegalArgumentException e) {
       // not base64: compare the text itself
     }
-    String owner = counted.get(fingerprint);
-    if (owner != null && !owner.equals(identity)) {
-      return "signer " + identity + " verified under a key already counted for " + owner
-          + "; two approver identities sharing one key count once (DIV §4.4.6)";
+    return fingerprint;
+  }
+
+  /**
+   * Seed the counted-key map with every excluded identity's trusted keys (DIV §4.4.6), exactly as
+   * the reference's seedExcludedSigningKeys: each key is recorded as already counted for
+   * "excluded identity &lt;did&gt;" (a later excluded identity sharing the key overwrites the label),
+   * so an eligible alias verifying under it is refused by {@link #sharedKeyProblem} with the shared-key
+   * reason. Eligibility is untouched. Key-set anchors carry no identities and seed nothing.
+   *
+   * @return the refusal reason when the resolver THROWS for an excluded identity, else null
+   */
+  private static String seedExcludedSigningKeys(Map<String, String> counted, ApproverTrustAnchor anchor,
+      Set<String> excludedDids) {
+    if (anchor.isKeySetMode()) return null;
+    for (String did : excludedDids) {
+      List<String> keys;
+      try {
+        keys = anchor.keysForIdentity(did);
+      } catch (RuntimeException e) {
+        // Fail closed: a lookup outage must not drop an excluded identity's keys from the alias
+        // check. A resolver that returns null or no keys is not a failure.
+        return "could not resolve keys for excluded identity " + did
+            + "; refusing rather than ignoring its keys (DIV §4.4.6)";
+      }
+      for (String key : keys) counted.put(keyFingerprint(key), "excluded identity " + did);
     }
-    counted.put(fingerprint, identity);
     return null;
   }
 
@@ -461,14 +558,14 @@ public final class Verify {
   public static VerifyResult verifyApprovalReceipt(
       ApprovalReceipt receipt, Expected expected, VerifyOptions opts) {
     if (isEmpty(receipt.canonicalPayload())) {
-      return VerifyResult.refuse("missing canonicalPayload");
+      return VerifyResult.refuse(UNPARSEABLE_PAYLOAD_REASON);
     }
 
     CanonicalFields fields;
     try {
       fields = Records.JSON.readValue(receipt.canonicalPayload(), CanonicalFields.class);
     } catch (Exception e) {
-      return VerifyResult.refuse("canonicalPayload is not valid JSON");
+      return VerifyResult.refuse(UNPARSEABLE_PAYLOAD_REASON);
     }
     String tenantIssue = tenantProblem(fields.v(), fields.tenantId(), expected == null ? null : expected.tenantId());
     if (tenantIssue != null) return VerifyResult.refuse(tenantIssue);
@@ -478,8 +575,18 @@ public final class Verify {
     if (Div.DELEGATION_TYPE.equals(fields.type())) {
       return VerifyResult.refuse(
           "this is a delegation, which authorizes no action on its own — verify it with"
-              + " VerifyDelegation and pass the result as opts.Delegation, together with an offline"
+              + " Verify.verifyDelegation and pass the result as VerifyOptions.builder().delegation(...), together with an offline"
               + " approval signed by the delegated operators");
+    }
+    // Same structural rule for an agent authority and a platform hash-only intent: each is refused
+    // with its own message (the reference's text) so a holder is pointed at the right verifier.
+    if (Div.AGENT_AUTHORITY_TYPE.equals(fields.type())) {
+      return VerifyResult.refuse("this is an agent authority, which authorizes no action on its own — verify"
+          + " it with Verify.verifyAgentAuthority; execution still requires an approval receipt");
+    }
+    if (Div.PLATFORM_INTENT_TYPE.equals(fields.type())) {
+      return VerifyResult.refuse(
+          "this is a platform hash-only intent (DIV §5c) — verify it with Verify.verifyPlatformReceipt");
     }
     // A DEWP execution-evidence statement (DEWP §4.7) is a source's observation AFTER execution, not
     // an approval. Refused with its own reason, like the other non-approval kinds.
@@ -493,7 +600,7 @@ public final class Verify {
     }
     if (offline && !opts.allowOffline()) {
       return VerifyResult.refuse(
-          "this is an offline approval; set AllowOffline at the specific call site permitted to run under one");
+          "this is an offline approval; pass VerifyOptions.builder().allowOffline(true) at the specific call site permitted to run under one");
     }
     // A delegation only ever substitutes the approver set for an OFFLINE proof. Accepting it
     // against an ordinary gateway-mediated receipt would silently replace the quorum the gateway
@@ -506,7 +613,7 @@ public final class Verify {
     // nonce satisfy a caller that never issued a challenge at all.
     if (isEmpty(expected.nonce())) {
       return VerifyResult.refuse(
-          "expected.Nonce is required — it must be the challenge YOU issued (DIV §5 step 10)");
+          "expected.nonce() is required — it must be the challenge YOU issued (DIV §5 step 10)");
     }
     if (!Objects.equals(nz(fields.nonce()), expected.nonce())) {
       return VerifyResult.refuse("receipt is for a different challenge");
@@ -519,13 +626,13 @@ public final class Verify {
     if (receipt.requester() == null) {
       return VerifyResult.refuse("receipt missing requester");
     }
-    if (expected != null && expected.requesterDid() != null
-        && !Objects.equals(receipt.requester().did(), expected.requesterDid())) {
-      return VerifyResult.refuse("approval was requested by a different principal");
-    }
+    if (opts.delegation() != null && !Objects.equals(receipt.requester().did(), opts.delegation().requesterDid()))
+      return VerifyResult.refuse("offline approval was requested by a different principal than the delegation");
     boolean agentIntent = fields.agent() != null;
-    if (agentIntent != (expected.agentContext() != null))
+    if (agentIntent && expected.agentContext() == null)
       return VerifyResult.refuse("agent receipt requires independently asserted PEP context");
+    if (!agentIntent && expected.agentContext() != null)
+      return VerifyResult.refuse("agent context was expected but is absent from the signed payload");
     String expiresAt = agentIntent ? fields.exp() : fields.expiresAt();
     if (isEmpty(expiresAt)) {
       return VerifyResult.refuse("receipt missing expiration");
@@ -535,11 +642,9 @@ public final class Verify {
       if (contextProblem != null) return VerifyResult.refuse("invalid independently asserted agent context: " + contextProblem);
       Object nestedAgent = expected.agentContext().get("agent");
       if (nestedAgent instanceof Map<?, ?> agentMap && agentMap.get("delegatedBy") != null) {
-        if (opts.agentAuthorityChain().isEmpty())
-          return VerifyResult.refuse("delegated agent receipt requires a trusted root-to-leaf authority chain");
         String requesterDid = expected == null ? null : expected.requesterDid();
-        if (isEmpty(requesterDid))
-          return VerifyResult.refuse("delegated agent receipt requires an independently asserted requester DID");
+        if (opts.agentAuthorityChain().isEmpty() || isEmpty(requesterDid))
+          return VerifyResult.refuse("delegated agent receipt requires a trusted root-to-leaf authority chain");
         VerifyResult chain = verifyAgentDelegationChain(
             opts.agentAuthorityChain(), new AgentDelegatedAction(
                 expected == null ? null : expected.tenantId(),
@@ -563,12 +668,12 @@ public final class Verify {
     // anchor would dereference to nothing instead of reaching the refusal it exists for.
     if (isEmpty(expected.target())) {
       return VerifyResult.refuse(
-          "expected.Target is required — it must be YOUR target identifier, asserted independently"
+          "expected.target() is required — it must be YOUR target identifier, asserted independently"
               + " of the receipt (DIV Target Isolation)");
     }
     if (expected.approvers() == null) {
       return VerifyResult.refuse(
-          "expected.Approvers is required — the Approver key MUST come from your own trust policy,"
+          "expected.approvers() is required — the Approver key MUST come from your own trust policy,"
               + " never from the receipt (DIV Invariant 3)");
     }
 
@@ -583,9 +688,17 @@ public final class Verify {
     if (quorumProblem != null) {
       return VerifyResult.refuse(quorumProblem);
     }
+    String extensionProblem = checkIdentityExtensions(receipt.requester(), fields.requirement());
+    if (extensionProblem != null) return VerifyResult.refuse(extensionProblem);
     String classProblem = checkSignerClass(fields.requirement());
     if (classProblem != null) {
       return VerifyResult.refuse(classProblem);
+    }
+    // DIV §5 step 3e, structural half: an offline intent cannot carry requireEnrolledDevice, and an
+    // ordinary one carries it only as `true` without a hardware requirement.
+    String deviceStructure = enrolledDeviceStructureProblem(fields.requirement(), !offline);
+    if (deviceStructure != null) {
+      return VerifyResult.refuse(deviceStructure);
     }
     String floorProblem = RequirementFloor.problem(fields.requirement(), expected.requirement());
     if (floorProblem != null) {
@@ -624,9 +737,8 @@ public final class Verify {
         return VerifyResult.refuse("offline proof expires before it was challenged");
       }
       if (window.compareTo(Duration.ofMinutes(Div.MAX_OFFLINE_WINDOW_MINUTES)) > 0) {
-        return VerifyResult.refuse(String.format(
-            "offline window is %.1f minutes, over the %d-minute maximum",
-            window.toMillis() / 60000.0, Div.MAX_OFFLINE_WINDOW_MINUTES));
+        return VerifyResult.refuse("offline window is " + Div.toFixed1(window.toMillis() / 60000.0)
+            + " minutes, over the " + Div.MAX_OFFLINE_WINDOW_MINUTES + "-minute maximum");
       }
       // The cap above bounds the window's WIDTH; this bounds its POSITION (DIV §5a.3 rule 3).
       // Without it a proof challenged for a date years out, with a compliant 60-minute window,
@@ -653,6 +765,9 @@ public final class Verify {
     int delegatedQuorum = 0;
     if (opts.delegation() != null) {
       VerifiedDelegation d = opts.delegation();
+      // The reference's order: tenant, use-time expiry, then target / actionType / params / quorum.
+      if (!Objects.equals(d.tenantId(), expected.tenantId()))
+        return VerifyResult.refuse("delegation and approval belong to different tenants");
       OffsetDateTime delegationExpiry;
       try {
         delegationExpiry = SignedTime.parse(d.expiresAt());
@@ -664,16 +779,12 @@ public final class Verify {
         int skew = opts.clockSkewSeconds() != null ? opts.clockSkewSeconds() : Div.DEFAULT_CLOCK_SKEW_SECONDS;
         if (now.isAfter(delegationExpiry.toInstant().plusSeconds(skew))) {
           return VerifyResult.refuse(
-              "delegation has expired (set AllowExpired for audit re-verification)");
+              "delegation has expired (pass VerifyOptions.builder().allowExpired(true) for audit re-verification)");
         }
       }
       if (!Objects.equals(nz(d.target()), nz(expected.target()))) {
         return VerifyResult.refuse("the delegation was issued for a different target");
       }
-      if (!Objects.equals(d.tenantId(), expected.tenantId()))
-        return VerifyResult.refuse("the delegation is bound to a different tenant");
-      if (!Objects.equals(receipt.requester().did(), d.requesterDid()))
-        return VerifyResult.refuse("offline approval was requested by a different principal than the delegation");
       if (!Objects.equals(nz(d.actionType()), nz(expected.actionType()))) {
         return VerifyResult.refuse("the delegation was issued for a different actionType");
       }
@@ -693,7 +804,7 @@ public final class Verify {
       // The offline payload's signed quorum must equal the delegated one, so the operators signed
       // the policy their signatures are being counted toward rather than a different one.
       if (fields.requirement().requiredApprovals() != d.delegatedQuorum()) {
-        return VerifyResult.refuse(String.format(
+        return VerifyResult.refuse(String.format(Locale.ROOT,
             "offline proof declares %d required approval(s) but the delegation delegates a quorum of %d",
             fields.requirement().requiredApprovals(), d.delegatedQuorum()));
       }
@@ -729,7 +840,7 @@ public final class Verify {
     } catch (Canonical.NonPortableValueException e) {
       // Almost always expected.params carrying a non-portable number. Deliberately DISTINCT from
       // the mismatch below: "do not match" would send an operator chasing a tampering that isn't there.
-      return VerifyResult.refuse("expected.Params is not canonicalizable: " + e.getMessage());
+      return VerifyResult.refuse("expected.params() is not canonicalizable: " + e.getMessage());
     }
 
     if (!recomputed.equals(receipt.canonicalPayload())) {
@@ -747,8 +858,13 @@ public final class Verify {
       Instant now = opts.asOf() != null ? opts.asOf() : Instant.now();
       int skew = opts.clockSkewSeconds() != null ? opts.clockSkewSeconds() : Div.DEFAULT_CLOCK_SKEW_SECONDS;
       if (now.isAfter(expiry.toInstant().plusSeconds(skew))) {
-        return VerifyResult.refuse("proof has expired (set AllowExpired for audit re-verification)");
+        return VerifyResult.refuse("proof has expired (pass VerifyOptions.builder().allowExpired(true) for audit re-verification)");
       }
+    }
+    // Optional: assert WHICH workload the approval was granted to — after expiry, as in the reference.
+    if (expected.requesterDid() != null
+        && !Objects.equals(receipt.requester().did(), expected.requesterDid())) {
+      return VerifyResult.refuse("approval was requested by a different principal");
     }
 
     // A policy AUTO_APPROVED receipt carries NO human signature, so there is nothing to verify
@@ -763,19 +879,20 @@ public final class Verify {
             "an offline approval cannot be auto-approved — there is no human signature to verify");
       }
       if (!opts.allowAutoApproved()) {
-        return VerifyResult.refuseAutoApproved("AUTO_APPROVED receipts are refused by default");
+        return VerifyResult.refuseAutoApproved("auto-approved by policy — no human signature to verify"
+            + " (pass VerifyOptions.builder().allowAutoApproved(true) to accept)");
       }
       return VerifyResult.acceptAutoApproved();
     }
 
     List<ApprovalWitness> witnesses = witnessesOf(receipt);
     if (witnesses.isEmpty()) {
-      return VerifyResult.refuse("missing signature or public key");
+      return VerifyResult.refuse("receipt missing signature material");
     }
     // The witness list is attacker-supplied and every entry costs ECDSA verifications, in the
     // relying party's own process, immediately before the action it gates. Bound it.
     if (witnesses.size() > Div.MAX_WITNESSES) {
-      return VerifyResult.refuse(String.format(
+      return VerifyResult.refuse(String.format(Locale.ROOT,
           "receipt carries %d witnesses, above the %d this verifier will process",
           witnesses.size(), Div.MAX_WITNESSES));
     }
@@ -783,12 +900,27 @@ public final class Verify {
     if (fields.requirement().requiredApprovals() > 1 && expected.approvers().isKeySetMode())
       return VerifyResult.refuse("multi-approver quorum requires a DID-mode trust anchor (DIV §5 step 3b)");
     if (fields.requirement().requesterCannotApprove() && expected.approvers().isKeySetMode())
-      return VerifyResult.refuse("requesterCannotApprove requires a DID-mode trust anchor");
+      return VerifyResult.refuse("requesterCannotApprove requires a DID-mode trust anchor; key-only mode cannot authenticate requester identity");
+    if (fields.requirement().excludedSignerDids() != null
+        && !fields.requirement().excludedSignerDids().isEmpty() && expected.approvers().isKeySetMode())
+      return VerifyResult.refuse("requesterCannotApprove requires a DID-mode trust anchor; key-only mode cannot authenticate requester identity");
+    // DIV §5 step 3e, list half: decided before counting, like the anchor-shape checks above, so a
+    // caller missing its enrollment records is told so instead of reading a quorum shortfall.
+    Set<String> enrolledDevices = null;
+    if (fields.requirement().requiresEnrolledDevice()) {
+      String keysProblem = enrolledDeviceKeysProblem(expected.enrolledDeviceKeys());
+      if (keysProblem != null) return VerifyResult.refuse(keysProblem);
+      enrolledDevices = new LinkedHashSet<>();
+      for (String key : expected.enrolledDeviceKeys()) enrolledDevices.add(keyFingerprint(key));
+    }
     // Count DISTINCT approvers whose signature verifies under a key we independently trust.
     // Distinct is load-bearing: without it, N copies of one approver's signature satisfy an N-of-M
     // quorum.
     Set<String> verified = new LinkedHashSet<>(); Map<String, String> countedKeys = new LinkedHashMap<>();
     List<String> failures = new ArrayList<>();
+    Set<String> excludedDids = excludedSignerDids(receipt.requester(), fields.requirement());
+    String seedProblem = seedExcludedSigningKeys(countedKeys, expected.approvers(), excludedDids);
+    if (seedProblem != null) return VerifyResult.refuse(seedProblem);
     for (ApprovalWitness w : witnesses) {
       ApproverTrustAnchor.Candidates cands =
           expected.approvers().candidatesRestricted(w.signerDid(), w.signerPublicKey(), delegatedTo);
@@ -825,9 +957,17 @@ public final class Verify {
           continue;
         }
       }
+      // DIV §5 step 7: under requireEnrolledDevice only an ES256 witness under one of the caller's
+      // enrolled device keys counts. The key compared is the TRUSTED one it verified under, never
+      // the witness's own claim, so SPKI and COSE spellings of one key match.
+      if (enrolledDevices != null
+          && ("WEBAUTHN".equals(w.sigAlg()) || !enrolledDevices.contains(keyFingerprint(matchedKey)))) {
+        failures.add("signer " + w.signerDid()
+            + " did not sign with an enrolled approver device key, but the signed policy requires one");
+        continue;
+      }
       // Four-eyes, verified offline against the requester in the same signed payload.
-      if (fields.requirement().requesterCannotApprove()
-          && Objects.equals(w.signerDid(), receipt.requester().did())) {
+      if (excludedDids.contains(w.signerDid())) {
         failures.add("four-eyes: requester " + w.signerDid() + " cannot approve their own action");
         continue;
       }
@@ -844,7 +984,7 @@ public final class Verify {
       required = delegatedQuorum;
     }
     if (verified.size() < required) {
-      return VerifyResult.refuse(String.format(
+      return VerifyResult.refuse(String.format(Locale.ROOT,
           "quorum not met: %d of %d required approver signatures verified%s",
           verified.size(), required, foldFailures(failures)));
     }
@@ -867,33 +1007,29 @@ public final class Verify {
   public static DelegationVerification verifyDelegation(
       ApprovalReceipt receipt, Expected expected, VerifyOptions opts) {
     if (isEmpty(receipt.canonicalPayload())) {
-      return refuseDelegation("missing canonicalPayload");
+      return refuseDelegation(UNPARSEABLE_PAYLOAD_REASON);
     }
     CanonicalFields fields;
     try {
       fields = Records.JSON.readValue(receipt.canonicalPayload(), CanonicalFields.class);
     } catch (Exception e) {
-      return refuseDelegation("canonicalPayload is not valid JSON");
+      return refuseDelegation(UNPARSEABLE_PAYLOAD_REASON);
     }
     String tenantIssue = tenantProblem(fields.v(), fields.tenantId(), expected == null ? null : expected.tenantId());
     if (tenantIssue != null) return refuseDelegation(tenantIssue);
     if (!Div.DELEGATION_TYPE.equals(fields.type())) {
       return refuseDelegation("payload is not a div-delegation");
     }
-    if (expected.approvers() == null) {
-      return refuseDelegation(
-          "expected.Approvers is required — the Approver key MUST come from your own trust policy,"
-              + " never from the receipt (DIV Invariant 3)");
-    }
     // DIV §4.4.6: a Delegation REQUIRES an identity-associating anchor and MUST be refused under a
     // key-set anchor — at seal verification too, not only when delegatedTo is enforced at use time.
     // The sealing quorum names PEOPLE; in public-keys mode it would count credentials instead.
-    if (expected.approvers().isKeySetMode()) {
+    if (expected.approvers() != null && expected.approvers().isKeySetMode()) {
       return refuseDelegation(
-          "a delegation requires a DID-mode trust anchor (ApproverTrustAnchor.ofDids/ofDidsMultiKey);"
-              + " a key-set anchor cannot associate identities (DIV §4.4.6)");
+          "a delegation requires a DID-mode trust anchor (ApproverTrustAnchor.ofDids / ofDidsMultiKey); a key-set anchor"
+              + " cannot associate identities (DIV §4.4.6)");
     }
-    if (fields.delegatedTo() == null || fields.delegatedTo().isEmpty()) {
+    if (fields.delegatedTo() == null
+        || fields.delegatedTo().stream().anyMatch(d -> d == null || d.isEmpty())) {
       return refuseDelegation("delegation is missing a valid delegatedTo set");
     }
     if (fields.delegatedQuorum() == null || fields.delegatedQuorum() < 1) {
@@ -908,7 +1044,7 @@ public final class Verify {
       }
     }
     if (distinct.size() < fields.delegatedQuorum()) {
-      return refuseDelegation(String.format(
+      return refuseDelegation(String.format(Locale.ROOT,
           "delegation names %d distinct operator(s) but delegates a quorum of %d — it can never be satisfied",
           distinct.size(), fields.delegatedQuorum()));
     }
@@ -935,9 +1071,8 @@ public final class Verify {
       return refuseDelegation("delegation expires before it was sealed");
     }
     if (window.compareTo(Duration.ofHours(Div.MAX_DELEGATION_WINDOW_HOURS)) > 0) {
-      return refuseDelegation(String.format(
-          "delegation window is %.1f hours, over the %d-hour maximum",
-          window.toMillis() / 3600000.0, Div.MAX_DELEGATION_WINDOW_HOURS));
+      return refuseDelegation("delegation window is " + Div.toFixed1(window.toMillis() / 3600000.0)
+          + " hours, over the " + Div.MAX_DELEGATION_WINDOW_HOURS + "-hour maximum");
     }
     // Position, not just width (DIV §5a.6 step 1, mirroring §5a.3 rule 3). A forward-dated sealedAt
     // slides the 72-hour window arbitrarily far out, and §5a.8 names that cap as Delegation's ONLY
@@ -959,9 +1094,16 @@ public final class Verify {
     if (quorumProblem != null) {
       return refuseDelegation(quorumProblem);
     }
+    String extensionProblem = checkIdentityExtensions(receipt.requester(), fields.requirement());
+    if (extensionProblem != null) return refuseDelegation(extensionProblem);
     String classProblem = checkSignerClass(fields.requirement());
     if (classProblem != null) {
       return refuseDelegation(classProblem);
+    }
+    // DIV §5 step 3e: this payload kind can never carry requireEnrolledDevice.
+    String deviceStructure = enrolledDeviceStructureProblem(fields.requirement(), false);
+    if (deviceStructure != null) {
+      return refuseDelegation(deviceStructure);
     }
     String floorProblem = RequirementFloor.problem(fields.requirement(), expected.requirement());
     if (floorProblem != null) {
@@ -969,8 +1111,13 @@ public final class Verify {
     }
     if (isEmpty(expected.target())) {
       return refuseDelegation(
-          "expected.Target is required — it must be YOUR target identifier, asserted independently"
+          "expected.target() is required — it must be YOUR target identifier, asserted independently"
               + " of the delegation (DIV Target Isolation)");
+    }
+    if (expected.approvers() == null) {
+      return refuseDelegation(
+          "expected.approvers() is required — the delegating approvers MUST come from your own trust"
+              + " policy, never from the delegation (DIV Invariant 3)");
     }
 
     String recomputed;
@@ -988,7 +1135,7 @@ public final class Verify {
           fields.sealedAt(),
           fields.expiresAt(), expected.tenantId());
     } catch (Canonical.NonPortableValueException e) {
-      return refuseDelegation("expected.Params is not canonicalizable: " + e.getMessage());
+      return refuseDelegation("expected.params() is not canonicalizable: " + e.getMessage());
     }
     if (!recomputed.equals(receipt.canonicalPayload())) {
       return refuseDelegation("target/params/actionType do not match what was delegated");
@@ -998,7 +1145,7 @@ public final class Verify {
       Instant now = opts.asOf() != null ? opts.asOf() : Instant.now();
       int skew = opts.clockSkewSeconds() != null ? opts.clockSkewSeconds() : Div.DEFAULT_CLOCK_SKEW_SECONDS;
       if (now.isAfter(expiry.toInstant().plusSeconds(skew))) {
-        return refuseDelegation("delegation has expired (set AllowExpired for audit re-verification)");
+        return refuseDelegation("delegation has expired (pass VerifyOptions.builder().allowExpired(true) for audit re-verification)");
       }
     }
     if ("AUTO_APPROVED".equals(receipt.sigAlg())) {
@@ -1012,12 +1159,15 @@ public final class Verify {
     }
     // Same denial-of-service bound as the approval path.
     if (witnesses.size() > Div.MAX_WITNESSES) {
-      return refuseDelegation(String.format(
+      return refuseDelegation(String.format(Locale.ROOT,
           "delegation carries %d witnesses, above the %d this verifier will process",
           witnesses.size(), Div.MAX_WITNESSES));
     }
     Set<String> verified = new LinkedHashSet<>(); Map<String, String> countedKeys = new LinkedHashMap<>();
     List<String> failures = new ArrayList<>();
+    Set<String> excludedDids = excludedSignerDids(receipt.requester(), fields.requirement());
+    String seedProblem = seedExcludedSigningKeys(countedKeys, expected.approvers(), excludedDids);
+    if (seedProblem != null) return refuseDelegation(seedProblem);
     for (ApprovalWitness w : witnesses) {
       ApproverTrustAnchor.Candidates cands =
           expected.approvers().candidatesRestricted(w.signerDid(), w.signerPublicKey(), null);
@@ -1051,8 +1201,7 @@ public final class Verify {
           continue;
         }
       }
-      if (fields.requirement().requesterCannotApprove()
-          && Objects.equals(w.signerDid(), receipt.requester().did())) {
+      if (excludedDids.contains(w.signerDid())) {
         failures.add("four-eyes: requester " + w.signerDid() + " cannot delegate to themselves");
         continue;
       }
@@ -1062,7 +1211,7 @@ public final class Verify {
     }
     int required = fields.requirement().requiredApprovals();
     if (verified.size() < required) {
-      return refuseDelegation(String.format(
+      return refuseDelegation(String.format(Locale.ROOT,
           "delegation quorum not met: %d of %d required approver signatures verified%s",
           verified.size(), required, foldFailures(failures)));
     }
@@ -1133,6 +1282,81 @@ public final class Verify {
           + " human-approved (DIV §4.3.2)";
     }
     return null;
+  }
+
+  /** DIV §5 step 3e reasons. Identical text in every port (pinned by verifier-parity-vectors.json). */
+  public static final String ENROLLED_DEVICE_MALFORMED_REASON =
+      "requirement.requireEnrolledDevice must be omitted or true (DIV §4.3.2)";
+  public static final String ENROLLED_DEVICE_ORDINARY_ONLY_REASON = Canonical.ENROLLED_DEVICE_ORDINARY_ONLY;
+  public static final String ENROLLED_DEVICE_WITH_HARDWARE_REASON = Canonical.ENROLLED_DEVICE_WITH_HARDWARE;
+  public static final String ENROLLED_DEVICE_KEYS_REQUIRED_REASON =
+      "the signed policy requires an enrolled approver device; supply expected.enrolledDeviceKeys() from"
+          + " your own enrollment records (DIV §4.3.2)";
+  public static final String ENROLLED_DEVICE_KEYS_MALFORMED_REASON =
+      "expected.enrolledDeviceKeys() must be an array of base64 public keys";
+
+  /**
+   * DIV §5 step 3e, structural half: the field is absent, or exactly {@code true} on an ordinary
+   * intent with no hardware requirement. {@code ordinary} is whether the payload type is
+   * {@code div-intent-verification}. Read from the parsed signed requirement, where a present
+   * {@code false} or {@code null} binds as FALSE (see NullIsMalformed) and is refused, not dropped.
+   */
+  private static String enrolledDeviceStructureProblem(ApprovalRequirement requirement, boolean ordinary) {
+    if (requirement.requireEnrolledDevice() == null) return null;
+    if (!requirement.requireEnrolledDevice()) return ENROLLED_DEVICE_MALFORMED_REASON;
+    if (!ordinary) return ENROLLED_DEVICE_ORDINARY_ONLY_REASON;
+    if (requirement.requiresHardwareCredential()) return ENROLLED_DEVICE_WITH_HARDWARE_REASON;
+    return null;
+  }
+
+  /**
+   * DIV §5 step 3e, list half. Only consulted under a signed requireEnrolledDevice; a malformed
+   * entry is refused even then, never read as "no list". Null when the list is usable.
+   */
+  private static String enrolledDeviceKeysProblem(List<String> keys) {
+    if (keys == null) return ENROLLED_DEVICE_KEYS_REQUIRED_REASON;
+    for (String key : keys) {
+      if (key == null || key.isEmpty()) return ENROLLED_DEVICE_KEYS_MALFORMED_REASON;
+    }
+    if (keys.isEmpty()) return ENROLLED_DEVICE_KEYS_REQUIRED_REASON;
+    return null;
+  }
+
+  static boolean validDid(String did) {
+    if (did == null || !did.startsWith("did:") || did.length() == 4
+        || did.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 4096) return false;
+    for (int i = 0; i < did.length(); i++) {
+      char c = did.charAt(i);
+      if (c <= 0x20 || c == 0x7f || Character.isSurrogate(c)
+          && (i + 1 >= did.length() || !Character.isSurrogatePair(c, did.charAt(++i)))) return false;
+    }
+    return true;
+  }
+
+  private static String checkIdentityExtensions(RequesterIdentity requester, ApprovalRequirement requirement) {
+    if (requester.credentialIssuerDid() != null && !validDid(requester.credentialIssuerDid()))
+      return "signed requester.credentialIssuerDid must be a non-empty DID";
+    if (requirement.excludedSignerDids() != null) {
+      // Every entry's validity first, then repetition — the reference's order, so [bad, bad] is
+      // reported as malformed in every port.
+      for (String did : requirement.excludedSignerDids()) {
+        if (!validDid(did)) return "signed requirement.excludedSignerDids must be an array of valid DIDs";
+      }
+      if (new LinkedHashSet<>(requirement.excludedSignerDids()).size() != requirement.excludedSignerDids().size())
+        return "signed requirement.excludedSignerDids must not contain duplicates";
+    }
+    return null;
+  }
+
+  private static Set<String> excludedSignerDids(RequesterIdentity requester,
+      ApprovalRequirement requirement) {
+    Set<String> excluded = new LinkedHashSet<>();
+    if (requirement.excludedSignerDids() != null) excluded.addAll(requirement.excludedSignerDids());
+    if (requirement.requesterCannotApprove()) {
+      excluded.add(requester.did());
+      if (requester.credentialIssuerDid() != null) excluded.add(requester.credentialIssuerDid());
+    }
+    return excluded;
   }
 
   /** Shared refusal text for a signed quorum below DIV §4.3.2's minimum. */

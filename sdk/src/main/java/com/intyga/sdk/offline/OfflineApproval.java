@@ -33,9 +33,12 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Comparator;
+import java.util.Collections;
 import java.util.HexFormat;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Consumer;
 import java.util.regex.Pattern;
@@ -114,14 +117,15 @@ public final class OfflineApproval {
   public static ChallengeResult createOfflineChallenge(ChallengeRequest req) {
     String tenantId = req.bundle().tenantId();
     if (tenantId == null || tenantId.isEmpty()) {
-      return ChallengeResult.refuse("the verified trust bundle must contain a non-empty tenantId");
+      return ChallengeResult.refuse("trust bundle tenantId must be a non-empty string");
     }
     // DIV §3 Invariant 5 (Target Isolation): a blank target binds no execution environment, so the
     // approval would verify at every relying party that also asserts it.
     if (req.target() == null || Js.trim(req.target()).isEmpty()) {
       return ChallengeResult.refuse("target is required (DIV Target Isolation)");
     }
-    ResolvedRequirement resolved = req.bundle().requirementFor(req.actionType(), req.display()).orElse(null);
+    ResolvedRequirement resolved = req.bundle().requirementFor(req.actionType(), req.display(),
+        req.requester() == null ? null : req.requester().did()).orElse(null);
     if (resolved == null) {
       return ChallengeResult.refuse("the trust bundle has no approval rule matching \"" + req.actionType()
           + "\" that can be selected unambiguously — configure the rule or export a fresh bundle with"
@@ -135,7 +139,15 @@ public final class OfflineApproval {
           + " credential, which cannot be produced offline — this action cannot be approved out of"
           + " band (DIV §5a.3)");
     }
+    // Same class of refusal: an offline key is never an enrolled approver device key (DIV §5a.3).
+    if (resolved.requirement().requiresEnrolledDevice()) {
+      return ChallengeResult.refuse("\"" + req.actionType() + "\" requires an enrolled approver device,"
+          + " which cannot sign offline — this action cannot be approved out of band (DIV §5a.3)");
+    }
 
+    if (!req.windowIsWhole()) {
+      return ChallengeResult.refuse("windowMinutes must be a whole number of minutes");
+    }
     int requested = req.windowMinutes() == null ? DEFAULT_WINDOW_MINUTES : req.windowMinutes();
     int windowMinutes = Math.min(Div.MAX_OFFLINE_WINDOW_MINUTES, Math.max(1, requested));
     Instant now = JsTime.nowOr(req.asOf());
@@ -151,13 +163,13 @@ public final class OfflineApproval {
     // rule could be presented against a strict one and overwrite its quorum (DIV §5a.5).
     VerifiedDelegation delegation = req.delegation();
     ApprovalRequirement base = resolved.requirement();
-    if (delegation != null && !tenantId.equals(delegation.tenantId())) {
-      return ChallengeResult.refuse("this delegation is not bound to the verified trust bundle tenant");
-    }
     if (delegation != null && delegation.delegatedQuorum() < base.requiredApprovals()) {
       return ChallengeResult.refuse("this delegation would lower the quorum for \"" + req.actionType()
           + "\" from " + base.requiredApprovals() + " to " + delegation.delegatedQuorum()
           + ". A delegation may narrow WHO approves, never HOW MANY (DIV §5a.5)");
+    }
+    if (delegation != null && !tenantId.equals(delegation.tenantId())) {
+      return ChallengeResult.refuse("delegation and trust bundle belong to different tenants");
     }
     // Under a delegation the eligible set and the quorum are the DELEGATED ones. Everything else in
     // the requirement still comes from the bundle.
@@ -165,11 +177,15 @@ public final class OfflineApproval {
         delegation == null
             ? base
             : new ApprovalRequirement(delegation.delegatedQuorum(), base.requireHardwareKey(),
-                base.allowedAaguids(), base.requesterCannotApprove(), base.signerClass());
+                base.allowedAaguids(), base.requesterCannotApprove(), base.signerClass(),
+                base.excludedSignerDids());
     List<String> approverDids =
         delegation == null
             ? resolved.approverDids()
             : delegation.delegatedTo() == null ? List.of() : List.copyOf(delegation.delegatedTo());
+
+    // Controller exclusions are already merged by requirementFor, which refuses a four-eyes rule
+    // without the requester's signed controller entry (DIV §5a.4).
 
     String canonicalPayload;
     try {
@@ -177,7 +193,7 @@ public final class OfflineApproval {
           req.display(), req.params(), req.requester(), requirement, nonce, challengedAt, expiresAt,
           tenantId);
     } catch (Canonical.NonPortableValueException e) {
-      return ChallengeResult.refuse("the action cannot be canonicalized portably: " + e.getMessage());
+      return ChallengeResult.refuse("the action cannot be canonicalized: " + e.getMessage());
     }
     return new ChallengeResult(true, null, new OfflineChallenge(
         nonce,
@@ -226,7 +242,7 @@ public final class OfflineApproval {
     }
     JsonNode type = parsed.get("type");
     if (type == null || !Div.OFFLINE_INTENT_TYPE.equals(type.textValue())) {
-      String shown = type == null ? "undefined" : type.isTextual() ? type.textValue() : type.toString();
+      String shown = type == null ? "undefined" : TrustBundle.jsString(type);
       return DecodedChallengeResult.refuse(
           "this is a " + shown + " payload, not an offline approval challenge — refusing to sign it");
     }
@@ -272,6 +288,18 @@ public final class OfflineApproval {
 
   /** Why a decoded challenge payload has the wrong shape, or null when every field is well-typed. */
   private static String challengeShapeProblem(JsonNode p) {
+    JsonNode v = p.get("v");
+    boolean v1 = v != null && v.isNumber() && v.doubleValue() == 1d;
+    boolean v2 = v != null && v.isNumber() && v.doubleValue() == 2d;
+    if (!v1 && !v2) {
+      return "has an unsupported DIV version";
+    }
+    if (v2 && !Js.isNonEmptyString(p.get("tenantId"))) {
+      return "is missing a non-empty tenantId";
+    }
+    if (v1 && p.has("tenantId")) {
+      return "carries tenantId under legacy DIV v1";
+    }
     for (String field : List.of("target", "actionType", "display", "nonce", "challengedAt", "expiresAt")) {
       if (!Js.isString(p.get(field))) {
         return "field " + field + " is not a string";
@@ -291,6 +319,18 @@ public final class OfflineApproval {
     JsonNode requirement = p.get("requirement");
     if (requirement == null || !requirement.isObject()) {
       return "requirement is not a JSON object";
+    }
+    // DIV §4.3.2 types, not merely bytes that re-serialize: requiredApprovals 1.5 canonicalizes to
+    // itself, yet no verifier would count toward it and no relying party builds it.
+    JsonNode quorum = requirement.get("requiredApprovals");
+    JsonNode hardware = requirement.get("requireHardwareKey");
+    JsonNode fourEyes = requirement.get("requesterCannotApprove");
+    if (!Js.isSafeInteger(quorum) || quorum.doubleValue() < 1
+        || hardware == null || !hardware.isBoolean()
+        || fourEyes == null || !fourEyes.isBoolean()
+        || !Js.isStringArray(requirement.get("allowedAaguids"), false)
+        || !Js.isString(requirement.get("signerClass"))) {
+      return "requirement is not a valid approval requirement";
     }
     return null;
   }
@@ -363,7 +403,14 @@ public final class OfflineApproval {
       attestation = new RequesterAttestation(
           a.get("method").textValue(), a.get("issuer").textValue(), a.get("subject").textValue());
     }
-    return new RequesterIdentity(n.get("did").textValue(), attestation);
+    // The signed credentialIssuerDid is part of the canonical bytes: dropping it here would make a
+    // valid challenge re-canonicalize differently. A present non-string cannot be canonicalized.
+    JsonNode issuer = n.get("credentialIssuerDid");
+    if (issuer != null && !issuer.isTextual()) {
+      return null;
+    }
+    return new RequesterIdentity(n.get("did").textValue(), attestation,
+        issuer == null ? null : issuer.textValue());
   }
 
   private static ApprovalRequirement requirement(JsonNode n) {
@@ -375,15 +422,24 @@ public final class OfflineApproval {
     JsonNode fourEyes = n.get("requesterCannotApprove");
     JsonNode aaguids = n.get("allowedAaguids");
     JsonNode signerClass = n.get("signerClass");
+    JsonNode excluded = n.get("excludedSignerDids");
+    // DIV §4.3.2: kept as signed, so the builder decides — `true` cannot be rebuilt into an offline
+    // payload and `false` is never emitted, as in the reference. A non-boolean cannot be
+    // canonicalized at all ("requireEnrolledDevice must be a boolean" in the reference).
+    JsonNode device = n.get("requireEnrolledDevice");
     if (quorum == null || !quorum.canConvertToInt() || !Js.isInteger(quorum)
         || hardware == null || !hardware.isBoolean()
         || fourEyes == null || !fourEyes.isBoolean()
         || !Js.isStringArray(aaguids, false)
-        || !Js.isString(signerClass)) {
+        || !Js.isString(signerClass)
+        || (excluded != null && !Js.isStringArray(excluded, false))
+        || (device != null && !device.isBoolean())) {
       return null;
     }
     return new ApprovalRequirement(quorum.intValue(), hardware.booleanValue(), Js.strings(aaguids),
-        fourEyes.booleanValue(), signerClass.textValue());
+        fourEyes.booleanValue(), signerClass.textValue(),
+        excluded == null ? null : Js.strings(excluded),
+        device == null ? null : Boolean.valueOf(device.booleanValue()));
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -517,6 +573,10 @@ public final class OfflineApproval {
       return SignResult.refuse(decoded.reason());
     }
     DecodedChallenge challenge = decoded.challenge();
+    // v1 remains decodable for archived evidence, but every NEW signature must be tenant-bound.
+    if (challenge.tenantId() == null || challenge.tenantId().isEmpty()) {
+      return SignResult.refuse("legacy DIV v1 challenges are archival-only and cannot be signed");
+    }
     // A timestamp we cannot read is not one we can say is still valid (DIV §6.2).
     Long expiry = JsTime.parseMillis(challenge.expiresAt());
     if (expiry == null) {
@@ -524,9 +584,6 @@ public final class OfflineApproval {
     }
     if (expiry <= JsTime.nowOr(asOf).toEpochMilli()) {
       return SignResult.refuse("this challenge has already expired — ask for a fresh one");
-    }
-    if (challenge.tenantId() == null || challenge.tenantId().isEmpty()) {
-      return SignResult.refuse("legacy v1 offline challenges cannot be newly signed; tenant-bound v2 is required");
     }
     if (signerDid == null || !signerDid.startsWith("did:")) {
       return SignResult.refuse("signerDid must be a DID");
@@ -686,7 +743,8 @@ public final class OfflineApproval {
     // DIV §5 step 3d. The signed requirement is the signers' own statement, so it is held to the
     // bundle's ORDINARY rule, re-resolved here rather than read back from the challenge. Under a
     // delegation that is still the right floor: the delegated quorum was refused if lower.
-    ResolvedRequirement ordinary = bundle.requirementFor(expected.actionType(), expected.display()).orElse(null);
+    ResolvedRequirement ordinary = bundle.requirementFor(expected.actionType(), expected.display(),
+        opts.requesterDid()).orElse(null);
     if (ordinary == null) {
       return OfflineApprovalResult.refuse("no unambiguous approval rule applies to this action");
     }
@@ -704,7 +762,9 @@ public final class OfflineApproval {
             // Restricted to the approvers eligible for THIS action, so a valid signature from
             // someone outside the rule does not count. The one place offline keys count: this
             // receipt is a div-offline-intent.
-            bundle.approverAnchor(challenge.approverDids(), AnchorPurpose.OFFLINE_INTENT),
+            bundle.approverAnchor(challenge.approverDids(), AnchorPurpose.OFFLINE_INTENT,
+                excludedDidsFor(ordinary.requirement(), opts.requesterDid(),
+                    challenge.requester() == null ? null : challenge.requester().credentialIssuerDid())),
             null,
             floorOf(ordinary.requirement())).withTenantId(bundle.tenantId())
                 .withRequesterDid(opts.requesterDid()),
@@ -740,13 +800,29 @@ public final class OfflineApproval {
   private record FoundDelegation(VerifiedDelegation delegation, String reason) {}
 
   /**
+   * Identities whose keys must stay resolvable for key-alias refusal: the rule's excluded signers
+   * and, under {@code requesterCannotApprove}, the requester and its credential issuer.
+   */
+  private static List<String> excludedDidsFor(ApprovalRequirement requirement, String requesterDid,
+      String issuerDid) {
+    Set<String> excluded = new LinkedHashSet<>();
+    if (requirement.excludedSignerDids() != null) excluded.addAll(requirement.excludedSignerDids());
+    if (requirement.requesterCannotApprove()) {
+      if (requesterDid != null) excluded.add(requesterDid);
+      if (issuerDid != null) excluded.add(issuerDid);
+    }
+    return new ArrayList<>(excluded);
+  }
+
+  /**
    * Find and verify a delegation covering this exact action. A file that does not apply is
    * REPORTED, not silently skipped: a delegation the operator believes they hold but which does not
    * apply is exactly what they need told during an incident. Files are tried in name order.
    */
   private static FoundDelegation findDelegation(
       Path dir, TrustBundle bundle, OfflineAction expected, String requesterDid, Instant asOf) {
-    ResolvedRequirement resolved = bundle.requirementFor(expected.actionType(), expected.display()).orElse(null);
+    ResolvedRequirement resolved = bundle.requirementFor(expected.actionType(), expected.display(),
+        requesterDid).orElse(null);
     if (resolved == null) {
       return new FoundDelegation(null,
           "no unambiguous ordinary approval rule applies to this delegation — export a fresh trust bundle");
@@ -785,7 +861,9 @@ public final class OfflineApproval {
               expected.params(),
               // The ORDINARY approver set — not the delegates — and ordinary keys only: an offline
               // signing key must never seal a delegation.
-              bundle.approverAnchor(resolved.approverDids(), AnchorPurpose.ORDINARY),
+              bundle.approverAnchor(resolved.approverDids(), AnchorPurpose.ORDINARY,
+                  excludedDidsFor(resolved.requirement(), requesterDid,
+                      receipt.requester() == null ? null : receipt.requester().credentialIssuerDid())),
               null,
               // DIV §5 step 3d / §5a.5: the sealing requirement may not be weaker than the rule.
               floorOf(ordinary)).withTenantId(bundle.tenantId()).withRequesterDid(requesterDid),
@@ -807,7 +885,12 @@ public final class OfflineApproval {
       if (sealed == null
           || sealed.requiredApprovals() < ordinary.requiredApprovals()
           || (ordinary.requireHardwareKey() && !sealed.requireHardwareKey())
+          // A delegation can never carry requireEnrolledDevice (DIV §4.3.2), so it can never be as
+          // strict as an ordinary rule that demands an enrolled device.
+          || ordinary.requiresEnrolledDevice()
           || (ordinary.requesterCannotApprove() && !sealed.requesterCannotApprove())
+          || (ordinary.excludedSignerDids() != null && (sealed.excludedSignerDids() == null
+              || !sealed.excludedSignerDids().containsAll(ordinary.excludedSignerDids())))
           || weakerAaguids) {
         rejected.add(name + ": delegation sealing requirement is weaker than the ordinary approval rule");
         continue;
@@ -820,7 +903,8 @@ public final class OfflineApproval {
 
   /** The DIV §5 step 3d floor a bundle rule imposes on a signed requirement. */
   private static RequirementFloor floorOf(ApprovalRequirement rule) {
-    return new RequirementFloor(rule.requiredApprovals(), rule.requesterCannotApprove(), rule.requireHardwareKey());
+    return new RequirementFloor(rule.requiredApprovals(), rule.requesterCannotApprove(),
+        rule.requireHardwareKey(), rule.excludedSignerDids(), rule.requiresEnrolledDevice());
   }
 
   // ---------------------------------------------------------------------------------------------

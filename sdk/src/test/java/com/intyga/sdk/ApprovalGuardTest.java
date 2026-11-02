@@ -221,6 +221,55 @@ class ApprovalGuardTest {
     assertThrows(NullPointerException.class, () -> options(trust()).build().wrap(null));
   }
 
+  /**
+   * DIV §4.3.2: a receipt whose signed policy requires an enrolled approver device is refused without
+   * the RP's enrolled device keys and accepted with them. The receipt is the shared
+   * enrolled-device-es256-under-listed-key-accepted vector (ES256, signed policy requireEnrolledDevice).
+   */
+  @Test
+  void enrolledDeviceReceiptNeedsTheRpsDeviceKeys() throws Exception {
+    JsonNode section = JSON.readTree(Files.readString(Path.of("vectors",
+        "verifier-parity-vectors.json"))).path("enrolledDevice");
+    JsonNode c = null;
+    for (JsonNode x : section.path("approvals").path("cases")) {
+      if (x.path("name").asText().equals("enrolled-device-es256-under-listed-key-accepted")) c = x;
+    }
+    assertNotNull(c, "enrolled-device vector missing");
+    String found = null;
+    for (JsonNode k : section.path("keys")) if (k.path("id").asText().equals("ed-device")) found = k.path("spkiB64").asText();
+    assertNotNull(found, "ed-device key missing");
+    final String deviceKey = found;
+    JsonNode expected = section.path("approvals").path("expected");
+    receipt = c.get("receipt").deepCopy();
+    nonce = expected.path("nonce").asText();
+    params = JSON.convertValue(expected.path("params"), new TypeReference<>() {});
+    ApprovalGuard.Builder device = ApprovalGuard.builder(client, ApproverTrustAnchor.ofPublicKeys(List.of(deviceKey)))
+        .target(expected.path("target").asText()).actionType(expected.path("actionType").asText())
+        .timeout(Duration.ofSeconds(1)).interval(Duration.ofMillis(1))
+        // The floor admits the flag too, so a receipt that dropped it would be refused as weaker.
+        .requirement(new RequirementFloor(1, false, false, null, true));
+
+    var calls = new java.util.concurrent.atomic.AtomicInteger();
+    var without = device.build().wrap(args -> { calls.incrementAndGet(); return "sent"; });
+    IntygaException refused = assertThrows(IntygaException.class, () -> without.call(params));
+    assertTrue(refused.getMessage().contains("supply expected.enrolledDeviceKeys() from your own enrollment records"),
+        refused.getMessage());
+    assertEquals(0, calls.get());
+    assertFalse(events.contains("consume"));
+
+    events.clear();
+    var with = device.enrolledDeviceKeys(List.of(deviceKey)).build().wrap(args -> { calls.incrementAndGet(); return "sent"; });
+    assertEquals("sent", with.call(params));
+    assertEquals(1, calls.get());
+    assertEquals(List.of("authorize", "status", "consume"), events);
+
+    String malformed = "ApprovalGuard.enrolledDeviceKeys must be an array of non-empty base64 keys";
+    assertEquals(malformed, assertThrows(IllegalArgumentException.class,
+        () -> device.enrolledDeviceKeys(List.of("")).build()).getMessage());
+    assertEquals(malformed, assertThrows(IllegalArgumentException.class,
+        () -> device.enrolledDeviceKeys(java.util.Arrays.asList(deviceKey, null)).build()).getMessage());
+  }
+
   @Test
   void unacknowledgedDispatchIsReportedWithoutRetryingTheTool() throws Exception {
     dispatchOk = false;

@@ -36,6 +36,11 @@ public final class ApprovalPolicy {
 
     boolean requesterCannotApprove();
 
+    default List<String> excludedSignerDids() { return null; }
+
+    /** DIV §4.3.2 "Enrolled approver devices". Absent means false. */
+    default boolean requireEnrolledDevice() { return false; }
+
     boolean requireAttestedRequester();
 
     List<String> allowedIssuers();
@@ -126,8 +131,16 @@ public final class ApprovalPolicy {
     if (other.requesterCannotApprove() && !selected.requesterCannotApprove()) {
       lost.add("requesterCannotApprove");
     }
+    if (other.excludedSignerDids() != null
+        && (selected.excludedSignerDids() == null
+            || !selected.excludedSignerDids().containsAll(other.excludedSignerDids()))) {
+      lost.add("excludedSignerDids");
+    }
     if (other.requireAttestedRequester() && !selected.requireAttestedRequester()) {
       lost.add("requireAttestedRequester");
+    }
+    if (other.requireEnrolledDevice() && !selected.requireEnrolledDevice()) {
+      lost.add("requireEnrolledDevice");
     }
     if (narrowsAllowlist(selected.allowedAaguids(), other.allowedAaguids())) {
       lost.add("allowedAaguids");
@@ -154,7 +167,9 @@ public final class ApprovalPolicy {
       if (!sameWindow(selected, other)
           || selected.requiredApprovals() != other.requiredApprovals()
           || selected.requireHardwareKey() != other.requireHardwareKey()
+          || selected.requireEnrolledDevice() != other.requireEnrolledDevice()
           || selected.requesterCannotApprove() != other.requesterCannotApprove()
+          || !sameSet(selected.excludedSignerDids(), other.excludedSignerDids())
           || selected.requireAttestedRequester() != other.requireAttestedRequester()
           || !sameSet(a, b)
           || !sameSet(selected.allowedAaguids(), other.allowedAaguids())
@@ -218,7 +233,9 @@ public final class ApprovalPolicy {
   }
 
   private static boolean sameSet(List<String> a, List<String> b) {
-    return subset(a, b) && subset(b, a);
+    List<String> left = a == null ? List.of() : a;
+    List<String> right = b == null ? List.of() : b;
+    return subset(left, right) && subset(right, left);
   }
 
   /** JavaScript truthiness of an optional string: non-null and non-empty. */

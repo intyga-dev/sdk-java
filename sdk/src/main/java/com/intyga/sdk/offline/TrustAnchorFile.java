@@ -28,6 +28,12 @@ import java.util.regex.Pattern;
  *     is always null here)
  * @param webauthn the approval console's origin and RP ID, or null when the file omits them
  * @param exportedAt may be null
+ * @param enrolledDeviceKeys online anchors only: the approver keys that are ENROLLED APPROVER DEVICE
+ *     keys (DIV §4.3.2), every one also pinned under some approver's {@code publicKeys} — the list
+ *     narrows which trusted keys count, it never adds trust. Pass it as
+ *     {@code Expected.withEnrolledDeviceKeys(...)} so a receipt whose signed policy requires an
+ *     enrolled device verifies. Never null: empty when the file names none (the reference's
+ *     {@code trustAnchorEnrolledDeviceKeys}).
  */
 public record TrustAnchorFile(
     TrustAnchorPurpose purpose,
@@ -36,11 +42,22 @@ public record TrustAnchorFile(
     List<BundleApprover> approvers,
     WebAuthnExpectation webauthn,
     String exportedAt,
-    String tenantId) {
+    String tenantId,
+    List<String> enrolledDeviceKeys) {
+
+  public TrustAnchorFile {
+    enrolledDeviceKeys = enrolledDeviceKeys == null ? List.of() : List.copyOf(enrolledDeviceKeys);
+  }
 
   public TrustAnchorFile(TrustAnchorPurpose purpose, long epoch, String label,
       List<BundleApprover> approvers, WebAuthnExpectation webauthn, String exportedAt) {
-    this(purpose, epoch, label, approvers, webauthn, exportedAt, null);
+    this(purpose, epoch, label, approvers, webauthn, exportedAt, null, null);
+  }
+
+  /** Source-compatible constructor for callers predating {@code enrolledDeviceKeys}. */
+  public TrustAnchorFile(TrustAnchorPurpose purpose, long epoch, String label,
+      List<BundleApprover> approvers, WebAuthnExpectation webauthn, String exportedAt, String tenantId) {
+    this(purpose, epoch, label, approvers, webauthn, exportedAt, tenantId, null);
   }
 
   /** The file's {@code type}. */
@@ -70,9 +87,15 @@ public record TrustAnchorFile(
    */
   public static TrustAnchorFile parse(String jsonText, TrustAnchorPurpose purpose) {
     TrustAnchorPurpose expected = purpose == null ? TrustAnchorPurpose.ONLINE : purpose;
-    JsonNode obj = Js.parse(jsonText);
-    if (obj == null) {
-      throw new InvalidTrustAnchorException("not valid JSON");
+    JsonNode obj;
+    try {
+      obj = jsonText == null ? null : Js.JSON.readTree(jsonText);
+    } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+      // "(<parser message>)", like the reference; the message itself is the parser's own.
+      throw new InvalidTrustAnchorException("not valid JSON (" + e.getOriginalMessage() + ")");
+    }
+    if (obj == null || obj.isMissingNode()) {
+      throw new InvalidTrustAnchorException("not valid JSON (Unexpected end of JSON input)");
     }
     if (!obj.isObject()) {
       throw new InvalidTrustAnchorException("root must be an object");
@@ -109,6 +132,10 @@ public record TrustAnchorFile(
     if (!Js.isSafeInteger(epoch)) {
       throw new InvalidTrustAnchorException("epoch must be at most " + MAX_SAFE_INTEGER);
     }
+    JsonNode tenantId = obj.get("tenantId");
+    if (tenantId != null && (!tenantId.isTextual() || tenantId.textValue().isEmpty())) {
+      throw new InvalidTrustAnchorException("tenantId must be a non-empty string when present");
+    }
     JsonNode label = obj.get("label");
     if (label != null && !label.isTextual()) {
       throw new InvalidTrustAnchorException("label must be a string");
@@ -116,10 +143,6 @@ public record TrustAnchorFile(
     JsonNode exportedAt = obj.get("exportedAt");
     if (exportedAt != null && !exportedAt.isTextual()) {
       throw new InvalidTrustAnchorException("exportedAt must be a string");
-    }
-    JsonNode tenantId = obj.get("tenantId");
-    if (tenantId != null && (!tenantId.isTextual() || tenantId.textValue().isEmpty())) {
-      throw new InvalidTrustAnchorException("tenantId must be a non-empty string when present");
     }
 
     JsonNode approvers = obj.get("approvers");
@@ -168,6 +191,34 @@ public record TrustAnchorFile(
       parsed.add(new BundleApprover(did, List.copyOf(keys), null));
     }
 
+    // Online only, and every entry pinned under some approver — the reference's texts and order.
+    List<String> enrolledDeviceKeys = List.of();
+    JsonNode devices = obj.get("enrolledDeviceKeys");
+    if (devices != null) {
+      if (filePurpose != TrustAnchorPurpose.ONLINE) {
+        throw new InvalidTrustAnchorException("enrolledDeviceKeys is only meaningful in an online anchor"
+            + " — offline approvals cannot use an enrolled device");
+      }
+      if (!devices.isArray()) {
+        throw new InvalidTrustAnchorException("enrolledDeviceKeys must be an array of base64 SPKI keys");
+      }
+      Set<String> pinned = new HashSet<>();
+      for (BundleApprover a : parsed) pinned.addAll(a.publicKeys());
+      List<String> listed = new ArrayList<>();
+      for (JsonNode key : devices) {
+        if (!key.isTextual() || !isBase64(key.textValue())) {
+          throw new InvalidTrustAnchorException("enrolledDeviceKeys must be an array of base64 SPKI keys");
+        }
+        String k = key.textValue();
+        if (!pinned.contains(k)) {
+          throw new InvalidTrustAnchorException("enrolledDeviceKeys entry " + k.substring(0, Math.min(16, k.length()))
+              + "… is not pinned under any approver — list it in that approver's publicKeys");
+        }
+        listed.add(k);
+      }
+      enrolledDeviceKeys = List.copyOf(listed);
+    }
+
     WebAuthnExpectation webauthn = null;
     JsonNode w = obj.get("webauthn");
     if (w != null) {
@@ -192,7 +243,8 @@ public record TrustAnchorFile(
         List.copyOf(parsed),
         webauthn,
         Js.text(exportedAt),
-        Js.text(tenantId));
+        Js.text(tenantId),
+        enrolledDeviceKeys);
   }
 
   /**
@@ -232,6 +284,8 @@ public record TrustAnchorFile(
 
   /** {@code JSON.stringify} of a value for a message; {@code undefined} for an absent one. */
   private static String show(JsonNode n) {
-    return n == null ? "undefined" : n.toString();
+    if (n == null) return "undefined";
+    // JSON.stringify prints 2.0 as 2; Jackson keeps the source spelling.
+    return n.isNumber() ? TrustBundle.jsString(n) : n.toString();
   }
 }

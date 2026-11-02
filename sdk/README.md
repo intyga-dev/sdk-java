@@ -22,11 +22,11 @@ Runtime dependencies: `com.intyga:intyga-verify` and Jackson (`jackson-databind`
 <dependency>
   <groupId>com.intyga</groupId>
   <artifactId>intyga-sdk</artifactId>
-  <version>2.1.0</version>
+  <version>2.3.0</version>
 </dependency>
 ```
 
-Gradle: `implementation("com.intyga:intyga-sdk:2.1.0")`.
+Gradle: `implementation("com.intyga:intyga-sdk:2.3.0")`.
 
 ## Require a human approval before a high-risk action
 
@@ -126,7 +126,10 @@ mutable inputs. The guard is blocking; its `Tool.call` can throw your callback's
 Optional dispatch reporting runs after a return or exception, and reporting/diagnostic failures
 cannot replace the original result or exception. Reporting is best effort, not a durable outbox;
 process exit can prevent it. The report window is 10–86400 seconds. Persist a retry by nonce if
-needed; do not rerun the tool to retry its report.
+needed; do not rerun the tool to retry its report. For a rule that requires an enrolled approver
+device (DIV §4.3.2), pass your enrolled device keys with `.enrolledDeviceKeys(anchor.enrolledDeviceKeys())`
+from your trust-anchor file; without them such a receipt is refused, and a null or empty entry is
+refused when the guard is built. The floor accepts the flag as `new RequirementFloor(1, false, false, null, true)`.
 
 This ordinary approval guard uses a human or `SERVICE` key. It does not implement the `AI_AGENT`
 v1 runtime, session and budget gate; that integration remains in the TypeScript MCP adapter.
@@ -204,6 +207,14 @@ if (r.status() == ApprovalStatus.OFFLINE_APPROVED) { /* a conscious decision at 
 
 `TrustBundle.approverAnchor` requires an explicit eligible DID list for `OFFLINE_INTENT` and throws
 when it is null. `ORDINARY` retains null as an intentional unrestricted anchor.
+
+A rule that requires an enrolled approver device (DIV §4.3.2) arrives in a version 2 trust bundle, the
+only version that may carry `requireEnrolledDevice`, and only as `true`. `requirementFor` resolves it
+with the field set, and `createOfflineChallenge` refuses it: an offline key is never an enrolled
+device key, so the action cannot be approved out of band. An online trust-anchor file may list
+`enrolledDeviceKeys` (each also pinned under an approver's `publicKeys`); pass
+`TrustAnchorFile.enrolledDeviceKeys()` to `Expected.withEnrolledDeviceKeys(...)` when verifying such a
+receipt.
 
 ## Examples
 

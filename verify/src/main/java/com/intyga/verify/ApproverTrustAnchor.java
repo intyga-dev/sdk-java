@@ -54,6 +54,17 @@ public final class ApproverTrustAnchor {
     return publicKeys != null;
   }
 
+  /** Resolve a trusted identity's keys without making that identity eligible to count. */
+  List<String> keysForIdentity(String did) {
+    if (publicKeys != null || did == null) return List.of();
+    if (resolveKeys != null) {
+      List<String> keys = resolveKeys.apply(did);
+      return keys == null ? List.of() : keys.stream().filter(k -> k != null && !k.isEmpty()).toList();
+    }
+    String key = resolveKey == null ? null : resolveKey.apply(did);
+    return key == null || key.isEmpty() ? List.of() : List.of(key);
+  }
+
   /** One (key, identity) candidate pair for a witness. */
   record Candidate(String key, String identity) {}
 
@@ -72,31 +83,31 @@ public final class ApproverTrustAnchor {
   }
 
   Candidates candidatesRestricted(String signerDid, String presentedKey, List<String> restrictTo) {
-    if (publicKeys != null && !publicKeys.isEmpty()) {
+    // Refusal texts and their order are the reference's (candidateKeys in @intyga/verify), so a
+    // refusal reads identically in every port.
+    if (publicKeys != null) {
       // A delegation names identities, and in publicKeys mode signerDid is an unverified string —
       // enforcing delegatedTo against it would be security theatre. Refuse rather than pretend.
       if (restrictTo != null) {
         return new Candidates(
             null,
             "a delegation names approver identities, so it requires a DID-mode trust anchor"
-                + " (DIDs + ResolveKeys); in PublicKeys mode signerDid is unverified and delegatedTo"
+                + " (ApproverTrustAnchor.ofDids / ofDidsMultiKey); in ofPublicKeys mode signerDid is unverified and delegatedTo"
                 + " cannot be enforced");
       }
+      if (publicKeys.isEmpty()) return new Candidates(null, "trusted approver allowlist is empty");
       List<Candidate> out = new ArrayList<>(publicKeys.size());
       for (String k : publicKeys) {
         out.add(new Candidate(k, k));
       }
       return new Candidates(out, null);
     }
-    if (dids == null || dids.isEmpty()) {
-      return new Candidates(
-          null,
-          "expected.Approvers is required — the Approver key MUST come from your own trust policy,"
-              + " never from the receipt (DIV Invariant 3)");
+    if (dids == null) {
+      return new Candidates(null, "trust anchor must be ApproverTrustAnchor.ofPublicKeys or ApproverTrustAnchor.ofDids / ofDidsMultiKey");
     }
-    boolean found = signerDid != null && !signerDid.isEmpty() && dids.contains(signerDid);
-    if (!found) {
-      return new Candidates(null, "signer " + signerDid + " is not an authorized approver");
+    if (signerDid == null || signerDid.isEmpty() || !dids.contains(signerDid)) {
+      return new Candidates(null, "signer " + (signerDid == null || signerDid.isEmpty() ? "(unknown)" : signerDid)
+          + " is not an authorized approver");
     }
     if (restrictTo != null && !restrictTo.contains(signerDid)) {
       return new Candidates(null, "signer " + signerDid + " is not named in the delegation");
@@ -117,25 +128,33 @@ public final class ApproverTrustAnchor {
         }
       }
     }
+    if (!out.isEmpty()) return new Candidates(out, null);
     // Explicit directory mappings take precedence. Only when they yield no key may a pinned
     // self-certifying DID authenticate the exact key bytes carried by the witness.
-    if (out.isEmpty() && signerDid.startsWith("did:intyga:key:") && presentedKey != null) {
+    if (signerDid.startsWith("did:intyga:key:")) {
+      if (presentedKey == null || presentedKey.isEmpty()) {
+        return new Candidates(null,
+            "witness carries no public key to validate against self-certifying " + signerDid);
+      }
+      boolean matches;
       try {
         byte[] raw = Base64.getDecoder().decode(presentedKey);
         String fingerprint = Base64.getUrlEncoder().withoutPadding()
             .encodeToString(MessageDigest.getInstance("SHA-256").digest(raw));
-        if (signerDid.equals("did:intyga:key:" + fingerprint)) {
-          out.add(new Candidate(presentedKey, signerDid));
-        } else {
-          return new Candidates(null, "witness public key does not hash to the pinned self-certifying DID");
-        }
+        matches = signerDid.equals("did:intyga:key:" + fingerprint);
       } catch (Exception e) {
-        return new Candidates(null, "witness carries no valid public key for its self-certifying DID");
+        matches = false;
       }
+      if (!matches) {
+        return new Candidates(null, "witness public key does not hash to the pinned self-certifying DID"
+            + " (did:intyga:key), and the trust anchor names no keys for it");
+      }
+      return new Candidates(List.of(new Candidate(presentedKey, signerDid)), null);
     }
-    if (out.isEmpty()) {
-      return new Candidates(null, "no trusted key could be resolved for " + signerDid);
+    if (resolveKey == null && resolveKeys == null) {
+      return new Candidates(null, signerDid + " is not self-certifying (did:intyga:key:…) and the trust"
+          + " anchor provides no resolver");
     }
-    return new Candidates(out, null);
+    return new Candidates(null, "no trusted key could be resolved for " + signerDid);
   }
 }

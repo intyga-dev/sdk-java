@@ -12,7 +12,7 @@ Java 17 or newer. One declared runtime dependency — `jackson-databind`, for JS
 <dependency>
   <groupId>com.intyga</groupId>
   <artifactId>intyga-verify</artifactId>
-  <version>2.1.0</version>
+  <version>2.3.0</version>
 </dependency>
 ```
 
@@ -67,6 +67,26 @@ floor demands one — is refused before any signature is counted, with a reason 
 requirement is weaker than the relying party's policy"; an equal or stricter one passes. A malformed
 floor (quorum below 1) is refused rather than ignored. The same field exists on the delegation
 expectation (pass the ordinary rule) and the agent-authority expectation (your sealing policy).
+The floor's `excludedSignerDids` is a typed list: null means no exclusion floor, and an empty list
+demands that the signed field be present. Unlike the TypeScript and Python floors, which are plain
+objects and refuse an explicit JSON `null` as malformed, a Java caller passes no JSON here. Receipts
+are different: an explicit `null` issuer or exclusion set inside a receipt is refused, never read as
+absent. A floor kept as JSON policy goes through `RequirementFloor.fromJson(node)`, which throws
+`IllegalArgumentException` with the same malformed-floor text for a non-integer quorum, a flag that
+is not a boolean, or an exclusion set that is not a string array, instead of coercing it.
+
+**Enrolled approver devices (DIV §4.3.2).** A signed `requirement.requireEnrolledDevice: true` means
+only an approver device key counts: an ES256 witness that verifies under a key you list in
+`expected.withEnrolledDeviceKeys(keys)` (base64 SPKI or COSE, from your own enrollment records, for
+example a console trust-anchor export's `enrolledDeviceKeys`). Every listed key must also be a trusted
+key for its signer in `expected.approvers()`; the list narrows, it never adds trust. A WebAuthn witness
+never counts toward it. Without the list such a receipt is refused, and a null or empty entry is
+refused as malformed. The field is absent or exactly `true`: `false`, `null` or any other value is
+refused, as is the field on an offline intent, delegation or agent authority, or beside
+`requireHardwareKey` / `allowedAaguids`. `RequirementFloor.withRequireEnrolledDevice(true)` (or the
+five-argument constructor) refuses a signed requirement that does not demand one. In
+`ApprovalRequirement` the component is a `Boolean`: null when absent, `TRUE` when signed; the builders
+emit it only when `TRUE`.
 
 One byte of drift — a swapped target, an appended region — and verification fails, because the signature was over the exact bytes you just recomputed.
 
@@ -108,6 +128,11 @@ Additional receipt APIs and remaining limits:
   ordinary approval verifier continues to refuse it because a scope grant approves no action.
 - **DIV §5c Platform Hash-Only Intent** is verified separately with
   `Verify.verifyPlatformReceipt`, including mandatory WebAuthn origin/RP binding.
+- **A single stored WebAuthn assertion** is verified on its own with
+  `Verify.verifyWebAuthnWitness(WebAuthnWitness, WebAuthnWitnessExpectation)`: the expected
+  origin(s) and RP ID are mandatory, the credential key (DER SPKI or COSE_Key) must come from your
+  own record of the credential, and the same assertion check the receipt path runs applies (DER
+  signature only).
 - **The document-signing payload** (`canonicalDocumentPayload`). This port carries no document canonicalization and does not assert the `documentPayloads` vector section — as `verify-go`, `verify-rust` and `sdk-python` also deliberately do not: the section's own note marks it TS-only (document signing is a gateway-side ceremony, not part of the relying-party offline surface). Approval and ledger canonicalization are unaffected — it is document *signing* that is out of scope here.
 
 One further precision about the portable-number rule (DEWP §4.3.1). This port refuses a non-portable number rather than best-effort serializing it, like `verify-go` — with a single exception it is not able to see: Jackson normalizes an integer-form `-0` to `0` while parsing, so the sign is gone before the check runs and that one value is serialized as `0`. The float form `-0.0` is refused correctly. No conformant producer emits either (JavaScript's `JSON.stringify(-0)` is already `"0"`, and the reference producer refuses at ingestion), so this is reachable only from a hand-authored or foreign document. The spec permits both responses, so the behaviour is conformant either way; it is stated here because "refuses" would otherwise be very slightly overclaiming.
@@ -218,6 +243,8 @@ embedded-key contradiction with no policy is neither. `sources` carries per-sour
 verified, which exposes a statement withheld from inside the exported range.
 `requireExecutionConfirmed` fails on any nonce that is not `confirmed`, on a dispatch conflict, a
 late contradiction, an untrusted contradiction, a gap or a divergence, and on a bundle that reports
-no nonce. A single proof (`Dewp.verifyBundle`) can evaluate steps 1–4 only and reports `unbound`; its
+no nonce. It also rejects any `COMMITMENT_ONLY` entry in the covered bundle, because undisclosed
+content could hide a contradiction. Without the strict option, inclusion-only verification remains
+valid and reports the redaction. A single proof (`Dewp.verifyBundle`) can evaluate steps 1–4 only and reports `unbound`; its
 anchored time comes from the proof's own quorum and is given to its signature check as well.
 `confirmed` reports what a caller-trusted source observed, never physical truth (§4.7.6).

@@ -627,6 +627,8 @@ public final class Dewp {
     var execution = ExecutionEvidence.evaluate(contentLeaves, new ExecutionEvidence.Options(o.evidencePolicy(),
         o.executionNowMs(), o.evidenceSkewSeconds(), o.maxEvidenceWindowSeconds(), anchoredTime));
     if (o.requireExecutionConfirmed()) {
+      if (commitOnly > 0) failures.add(new Failure("-",
+          "Required confirmed execution: COMMITMENT_ONLY entries may conceal execution evidence"));
       if (execution.byNonce().isEmpty()) failures.add(new Failure("-", "Required confirmed execution: the bundle records no execution"));
       for (var item : execution.byNonce().entrySet()) {
         var status = item.getValue();

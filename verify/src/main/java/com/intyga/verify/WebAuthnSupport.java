@@ -1,6 +1,5 @@
 package com.intyga.verify;
 
-import com.fasterxml.jackson.annotation.JsonProperty;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -37,12 +36,7 @@ final class WebAuthnSupport {
    */
   static String backupFlagsProblem(ApprovalWitness w) {
     if (!"WEBAUTHN".equals(w.sigAlg()) || w.authenticatorData() == null) return null;
-    byte[] authData;
-    try {
-      authData = decodeBase64Flexible(w.authenticatorData());
-    } catch (IllegalArgumentException e) {
-      return "authenticatorData is unreadable";
-    }
+    byte[] authData = decodeNodeBase64(w.authenticatorData());
     if (authData.length < 37) return "authenticatorData is unreadable";
     if ((authData[32] & (FLAG_BE | FLAG_BS)) == 0) return null;
     return "signer " + w.signerDid() + " used a backup-eligible (synced) passkey — authenticatorData"
@@ -133,15 +127,13 @@ final class WebAuthnSupport {
           return items;
         }
         case 5: { // map
-          Map<Long, Object> m = new HashMap<>();
+          // Keys of any decoded type, as in the reference's Map: COSE_Key labels are integers, and a
+          // non-integer key simply never matches one (byte-string keys compare by identity there).
+          Map<Object, Object> m = new HashMap<>();
           for (long i = 0; i < value; i++) {
             Object key = decodeItem();
             Object val = decodeItem();
-            // COSE_Key labels are all integers; non-integer keys are outside the accepted subset.
-            if (!(key instanceof Long ik)) {
-              throw new Ecdsa.Refusal("expected integer COSE label");
-            }
-            m.put(ik, val);
+            m.put(key instanceof byte[] ? new Object() : key, val);
           }
           return m;
         }
@@ -161,53 +153,67 @@ final class WebAuthnSupport {
     try {
       item = new CborReader(coseBuf).decodeItem();
     } catch (Ecdsa.Refusal e) {
-      throw new Ecdsa.Refusal("invalid COSE public key format: " + e.getMessage());
+      throw new Ecdsa.Refusal("Invalid COSE public key format: " + e.getMessage());
     }
     if (!(item instanceof Map<?, ?> m)) {
-      throw new Ecdsa.Refusal("invalid COSE public key format: expected a CBOR map");
+      throw new Ecdsa.Refusal("Invalid COSE public key format: expected a CBOR map");
     }
-    if (!(m.get(1L) instanceof Long kty) || kty != 2) {
-      throw new Ecdsa.Refusal("invalid COSE public key format: expected kty EC2 (2)");
+    // The reference's texts, with the offending value rendered as JavaScript's String() would.
+    Object kty = m.get(1L);
+    if (!(kty instanceof Long k) || k != 2) {
+      throw new Ecdsa.Refusal("Invalid COSE public key format: expected kty EC2 (2), got " + jsString(kty));
     }
-    if (!(m.get(-1L) instanceof Long crv) || crv != 1) {
-      throw new Ecdsa.Refusal("invalid COSE public key format: expected crv P-256 (1)");
+    Object crv = m.get(-1L);
+    if (!(crv instanceof Long c) || c != 1) {
+      throw new Ecdsa.Refusal("Invalid COSE public key format: expected crv P-256 (1), got " + jsString(crv));
     }
     Object alg = m.get(3L);
     if (alg != null && (!(alg instanceof Long a) || a != -7)) {
-      throw new Ecdsa.Refusal("invalid COSE public key format: expected alg ES256 (-7)");
+      throw new Ecdsa.Refusal("Invalid COSE public key format: expected alg ES256 (-7), got " + jsString(alg));
     }
     byte[] x = coordinate(m, -2L, "x");
     byte[] y = coordinate(m, -3L, "y");
     return Ecdsa.publicKeyFromCoordinates(new BigInteger(1, x), new BigInteger(1, y));
   }
 
+  /** JavaScript's String() of a decoded CBOR value, for refusal texts. */
+  private static String jsString(Object v) {
+    if (v == null) return "undefined";
+    if (v instanceof byte[] b) return new String(b, StandardCharsets.UTF_8);
+    if (v instanceof List<?> l) {
+      StringBuilder out = new StringBuilder();
+      for (int i = 0; i < l.size(); i++) {
+        if (i > 0) out.append(',');
+        out.append(jsString(l.get(i)));
+      }
+      return out.toString();
+    }
+    if (v instanceof Map<?, ?>) return "[object Map]";
+    return String.valueOf(v);
+  }
+
   private static byte[] coordinate(Map<?, ?> m, long label, String name) throws Ecdsa.Refusal {
     if (!(m.get(label) instanceof byte[] raw)) {
-      throw new Ecdsa.Refusal("invalid COSE public key format: missing " + name + " coordinate");
+      throw new Ecdsa.Refusal("Invalid COSE public key format: missing " + name + " coordinate");
     }
     if (raw.length != 32) {
       throw new Ecdsa.Refusal(
-          "invalid COSE public key format: " + name + " coordinate must be 32 bytes, got " + raw.length);
+          "Invalid COSE public key format: " + name + " coordinate must be 32 bytes, got " + raw.length);
     }
     return raw;
   }
 
-  private record ClientData(
-      String type,
-      String challenge,
-      String origin,
-      // crossOrigin is the only signal that separates "approved on our page" from "approved inside
-      // someone else's page": an embedded RP frame reports the RP's OWN origin and its rpIdHash
-      // matches too (W3C WebAuthn L3 §7.2 step 9).
-      @JsonProperty("crossOrigin") boolean crossOrigin,
-      // WebAuthn L3: the top-level page when the ceremony ran in a frame.
-      @JsonProperty("topOrigin") String topOrigin) {}
+  /** Supplies the credential key only after the cheaper checks, as the reference's keyOf() does. */
+  @FunctionalInterface
+  interface KeySupplier {
+    ECPublicKey get() throws Ecdsa.Refusal;
+  }
 
   /**
    * Verifies one WEBAUTHN witness against an already-TRUSTED key (from the caller's trust anchor,
-   * never the receipt): pins the assertion to the expected origin and RP ID, confirms user
-   * presence/verification, checks the challenge equals base64url(canonicalPayload), and verifies
-   * the ES256 signature over authenticatorData ‖ SHA-256(clientDataJSON). Returns "" on success.
+   * never the receipt). Fail closed without an expected origin and RP ID, then the shared assertion
+   * check ({@link #assertionProblem}). The COSE key is parsed from the TRUSTED key, not the
+   * receipt's copy. Returns "" on success.
    */
   static String verifyWitness(
       ApprovalWitness w, String trustedKey, ApprovalReceipt receipt, VerifyOptions opts) {
@@ -216,100 +222,193 @@ final class WebAuthnSupport {
     }
     // FAIL CLOSED: without an expected origin and RP ID there is nothing to pin the assertion to.
     if (isEmpty(opts.expectedOrigin()) || isEmpty(opts.expectedRpId())) {
-      return "WebAuthn receipts require ExpectedOrigin and ExpectedRpID — without them an assertion from any relying party would verify";
+      return "WebAuthn receipts require expectedOrigin and expectedRpId — without them an assertion from any relying party would verify";
     }
+    return assertionProblem(w.authenticatorData(), w.clientDataJSON(), w.signature(),
+        () -> parseCoseP256Key(decodeNodeBase64(trustedKey)), receipt.canonicalPayload(),
+        List.of(opts.expectedOrigin()), opts.expectedRpId(),
+        opts.requireUserVerification() == null || opts.requireUserVerification(),
+        opts.allowCrossOrigin());
+  }
 
-    byte[] clientDataBuf;
-    try {
-      clientDataBuf = decodeBase64Flexible(w.clientDataJSON());
-    } catch (IllegalArgumentException e) {
-      return "invalid clientDataJSON base64";
+  /**
+   * The standalone witness check ({@code verifyWebAuthnWitness} in the reference): expectations,
+   * then each field in order, then the same assertion check the receipt path runs. Never throws.
+   */
+  static String verifyStandaloneWitness(WebAuthnWitness witness, WebAuthnWitnessExpectation expectation) {
+    List<String> origins = expectation == null || expectation.expectedOrigin() == null
+        ? List.of() : expectation.expectedOrigin();
+    boolean originsOk = !origins.isEmpty();
+    for (String o : origins) originsOk &= o != null && !o.isEmpty();
+    if (!originsOk || expectation.expectedRpId() == null || expectation.expectedRpId().isEmpty()) {
+      return "a WebAuthn witness requires expectedOrigin and expectedRpId — without them an assertion"
+          + " from any relying party would verify";
     }
-    ClientData clientData;
-    try {
-      clientData = Records.JSON.readValue(clientDataBuf, ClientData.class);
-    } catch (Exception e) {
-      return "clientDataJSON is not valid JSON";
+    String[][] fields = {
+        {"signedPayload", witness == null ? null : witness.signedPayload()},
+        {"publicKey", witness == null ? null : witness.publicKey()},
+        {"authenticatorData", witness == null ? null : witness.authenticatorData()},
+        {"clientDataJSON", witness == null ? null : witness.clientDataJSON()},
+        {"signature", witness == null ? null : witness.signature()}};
+    for (String[] f : fields) {
+      if (isEmpty(f[1])) return "WebAuthn witness missing " + f[0];
     }
+    return assertionProblem(witness.authenticatorData(), witness.clientDataJSON(), witness.signature(),
+        () -> callerPublicKey(decodeNodeBase64(witness.publicKey())), witness.signedPayload(),
+        List.copyOf(origins), expectation.expectedRpId(),
+        expectation.requireUserVerification() == null || expectation.requireUserVerification(),
+        expectation.allowCrossOrigin());
+  }
 
-    // An assertion, not a registration: webauthn.create signs a different ceremony over the same
-    // challenge bytes and must never be accepted as approval.
-    if (!"webauthn.get".equals(clientData.type())) {
-      return "clientDataJSON is not a webauthn.get assertion";
+  /**
+   * A caller-supplied P-256 credential key: DER SPKI (a SEQUENCE, 0x30) or a COSE_Key (a CBOR map).
+   * A well-formed SPKI for any other key type is "public key is not a P-256 key", as in the reference.
+   */
+  private static ECPublicKey callerPublicKey(byte[] der) throws Ecdsa.Refusal {
+    if (der.length == 0 || der[0] != 0x30) return parseCoseP256Key(der);
+    try {
+      java.security.PublicKey pub = java.security.KeyFactory.getInstance("EC")
+          .generatePublic(new java.security.spec.X509EncodedKeySpec(der));
+      if (pub instanceof ECPublicKey ec) {
+        try {
+          return Ecdsa.parseSpkiP256(der);
+        } catch (Ecdsa.Refusal notP256) {
+          throw new Ecdsa.Refusal("public key is not a P-256 key");
+        }
+      }
+    } catch (java.security.GeneralSecurityException | IllegalArgumentException notEc) {
+      // fall through: maybe another algorithm's SPKI
     }
-    if (!opts.expectedOrigin().equals(clientData.origin())) {
-      return "assertion origin does not match ExpectedOrigin";
+    for (String alg : new String[] {"RSA", "Ed25519", "Ed448", "X25519", "X448", "DSA", "EC"}) {
+      try {
+        java.security.KeyFactory.getInstance(alg).generatePublic(new java.security.spec.X509EncodedKeySpec(der));
+        throw new Ecdsa.Refusal("public key is not a P-256 key");
+      } catch (java.security.GeneralSecurityException | IllegalArgumentException ignored) {
+        // not this algorithm
+      }
     }
-    if (clientData.crossOrigin() && !opts.allowCrossOrigin()) {
-      return "assertion was produced in a cross-origin frame (crossOrigin=true)";
-    }
-    // A topOrigin that differs from origin is the same embedding reported another way, refused
-    // exactly like crossOrigin=true (DIV §4.4.5 rule 5) — the gateway refuses it at ingest.
-    if (clientData.topOrigin() != null && !clientData.topOrigin().equals(clientData.origin())
-        && !opts.allowCrossOrigin()) {
-      return "assertion was produced in a frame embedded by another origin (topOrigin differs from origin)";
-    }
-    String expectedChallenge =
-        Base64.getUrlEncoder()
-            .withoutPadding()
-            .encodeToString(receipt.canonicalPayload().getBytes(StandardCharsets.UTF_8));
-    if (!expectedChallenge.equals(stripBase64Padding(clientData.challenge()))) {
-      return "clientDataJSON challenge does not match canonical payload";
-    }
+    throw new Ecdsa.Refusal("failed to parse SPKI public key");
+  }
 
-    byte[] authData;
+  /**
+   * The DIV §4.4.5 checks on one assertion — ceremony type, origin, cross-origin flag, challenge
+   * binding, RP ID hash, UP/UV flags and the DER ECDSA signature over authenticatorData ‖
+   * SHA-256(clientDataJSON) — in the reference's order (verifyWebAuthnAssertion). Shared by the
+   * receipt path and the standalone verifier, so there is one implementation. A failure the
+   * reference reports through its catch-all reads "WebAuthn verification failed: <detail>". Returns
+   * "" on success; never throws.
+   */
+  static String assertionProblem(String authenticatorDataB64, String clientDataB64, String signatureB64,
+      KeySupplier keyOf, String signedPayload, List<String> expectedOrigins, String expectedRpId,
+      boolean requireUserVerification, boolean allowCrossOrigin) {
     try {
-      authData = decodeBase64Flexible(w.authenticatorData());
-    } catch (IllegalArgumentException e) {
-      return "invalid authenticatorData base64";
-    }
-    if (authData.length < 37) {
-      return "authenticatorData is too short";
-    }
-    byte[] rpIdHash = sha256(opts.expectedRpId().getBytes(StandardCharsets.UTF_8));
-    byte[] presented = new byte[32];
-    System.arraycopy(authData, 0, presented, 0, 32);
-    if (!MessageDigest.isEqual(presented, rpIdHash)) {
-      return "authenticatorData rpIdHash does not match ExpectedRpID";
-    }
-    int flags = authData[32] & 0xff;
-    if ((flags & FLAG_UP) == 0) {
-      return "authenticatorData user-present flag is not set";
-    }
-    boolean requireUv =
-        opts.requireUserVerification() == null || opts.requireUserVerification();
-    if (requireUv && (flags & FLAG_UV) == 0) {
-      return "authenticatorData user-verified flag is not set";
-    }
+      byte[] clientDataBuf = decodeNodeBase64(clientDataB64);
+      com.fasterxml.jackson.databind.JsonNode clientData;
+      try {
+        clientData = Records.JSON.readTree(new String(clientDataBuf, StandardCharsets.UTF_8));
+      } catch (Exception e) {
+        return "WebAuthn verification failed: clientDataJSON is not valid JSON";
+      }
+      if (clientData == null || !clientData.isObject()) {
+        return "WebAuthn verification failed: clientDataJSON is not a JSON object";
+      }
+      // An assertion, not a registration: webauthn.create signs a different ceremony over the same
+      // challenge bytes and must never be accepted as approval.
+      com.fasterxml.jackson.databind.JsonNode type = clientData.get("type");
+      if (type == null || !type.isTextual() || !"webauthn.get".equals(type.textValue())) {
+        return "clientDataJSON is not a webauthn.get assertion";
+      }
+      com.fasterxml.jackson.databind.JsonNode origin = clientData.get("origin");
+      if (origin == null || !origin.isTextual() || !expectedOrigins.contains(origin.textValue())) {
+        return "assertion origin does not match expectedOrigin";
+      }
+      // crossOrigin is the only signal that separates "approved on our page" from "approved inside
+      // someone else's page": an embedded RP frame reports the RP's OWN origin and its rpIdHash
+      // matches too (W3C WebAuthn L3 §7.2 step 9).
+      com.fasterxml.jackson.databind.JsonNode crossOrigin = clientData.get("crossOrigin");
+      if (crossOrigin != null && crossOrigin.isBoolean() && crossOrigin.booleanValue() && !allowCrossOrigin) {
+        return "assertion was produced in a cross-origin frame (crossOrigin=true)";
+      }
+      // A topOrigin (present, even as null) that differs from origin is the same embedding reported
+      // another way, refused exactly like crossOrigin=true (DIV §4.4.5 rule 5).
+      com.fasterxml.jackson.databind.JsonNode topOrigin = clientData.get("topOrigin");
+      if (topOrigin != null && !(topOrigin.isTextual() && topOrigin.textValue().equals(origin.textValue()))
+          && !allowCrossOrigin) {
+        return "assertion was produced in a frame embedded by another origin (topOrigin differs from origin)";
+      }
+      com.fasterxml.jackson.databind.JsonNode challenge = clientData.get("challenge");
+      if (challenge == null || !challenge.isTextual()) {
+        return "WebAuthn verification failed: clientDataJSON challenge is not a string";
+      }
+      String expectedChallenge = Base64.getUrlEncoder().withoutPadding()
+          .encodeToString(signedPayload.getBytes(StandardCharsets.UTF_8));
+      String presentedChallenge = challenge.textValue().replace('+', '-').replace('/', '_').replace("=", "");
+      if (!expectedChallenge.equals(presentedChallenge)) {
+        return "clientDataJSON challenge does not match canonical payload";
+      }
 
-    // The COSE key is parsed from the TRUSTED key, not the receipt's copy.
-    byte[] coseBuf;
-    try {
-      coseBuf = decodeBase64Flexible(trustedKey);
-    } catch (IllegalArgumentException e) {
-      return "invalid trusted key base64";
-    }
-    ECPublicKey pub;
-    try {
-      pub = parseCoseP256Key(coseBuf);
-    } catch (Ecdsa.Refusal e) {
-      return e.getMessage();
-    }
-    byte[] sigBytes;
-    try {
-      sigBytes = decodeBase64Flexible(w.signature());
-    } catch (IllegalArgumentException e) {
-      return "invalid signature base64";
-    }
+      byte[] authData = decodeNodeBase64(authenticatorDataB64);
+      if (authData.length < 37) {
+        return "authenticatorData is too short";
+      }
+      byte[] rpIdHash = sha256(expectedRpId.getBytes(StandardCharsets.UTF_8));
+      byte[] presented = new byte[32];
+      System.arraycopy(authData, 0, presented, 0, 32);
+      if (!MessageDigest.isEqual(presented, rpIdHash)) {
+        return "authenticatorData rpIdHash does not match expectedRpId";
+      }
+      int flags = authData[32] & 0xff;
+      if ((flags & FLAG_UP) == 0) {
+        return "authenticatorData user-present flag is not set";
+      }
+      if (requireUserVerification && (flags & FLAG_UV) == 0) {
+        return "authenticatorData user-verified flag is not set";
+      }
 
-    byte[] clientDataHash = sha256(clientDataBuf);
-    byte[] signedData = new byte[authData.length + clientDataHash.length];
-    System.arraycopy(authData, 0, signedData, 0, authData.length);
-    System.arraycopy(clientDataHash, 0, signedData, authData.length, clientDataHash.length);
-    if (!Ecdsa.verifySignature(pub, signedData, sigBytes)) {
-      return "WebAuthn signature does not verify against the trusted signer key";
+      ECPublicKey pub;
+      try {
+        pub = keyOf.get();
+      } catch (Ecdsa.Refusal e) {
+        return "WebAuthn verification failed: " + e.getMessage();
+      }
+      byte[] sigBytes = decodeNodeBase64(signatureB64 == null ? "" : signatureB64);
+      byte[] clientDataHash = sha256(clientDataBuf);
+      byte[] signedData = new byte[authData.length + clientDataHash.length];
+      System.arraycopy(authData, 0, signedData, 0, authData.length);
+      System.arraycopy(clientDataHash, 0, signedData, authData.length, clientDataHash.length);
+      // DER only, as the reference's dsaEncoding: "der" — a raw r‖s signature does not verify.
+      if (!Ecdsa.verifyDerSignature(pub, signedData, sigBytes)) {
+        return "WebAuthn signature does not verify against the trusted signer key";
+      }
+      return "";
+    } catch (RuntimeException e) {
+      return "WebAuthn verification failed: " + e.getClass().getSimpleName();
     }
-    return "";
+  }
+
+  /**
+   * Node's {@code Buffer.from(s, "base64")}, which every reference read on this path uses: either
+   * alphabet, characters outside it skipped, decoding stops at padding, a dangling sixth-bit
+   * character dropped. Never throws, so a malformed encoding reaches the same check as in the
+   * reference (a short authenticatorData, a non-JSON clientDataJSON, a signature that does not
+   * verify) instead of a decoder error of its own.
+   */
+  static byte[] decodeNodeBase64(String s) {
+    if (s == null) return new byte[0];
+    StringBuilder b = new StringBuilder(s.length());
+    for (int i = 0; i < s.length(); i++) {
+      char c = s.charAt(i);
+      if (c == '=') break;
+      if (c == '-') c = '+';
+      else if (c == '_') c = '/';
+      if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '+' || c == '/') {
+        b.append(c);
+      }
+    }
+    if (b.length() % 4 == 1) b.setLength(b.length() - 1);
+    int rem = b.length() % 4;
+    if (rem != 0) b.append("==".substring(0, 4 - rem));
+    return Base64.getDecoder().decode(b.toString());
   }
 
   static byte[] sha256(byte[] data) {
@@ -318,33 +417,6 @@ final class WebAuthnSupport {
     } catch (NoSuchAlgorithmException e) {
       throw new IllegalStateException(e);
     }
-  }
-
-  /**
-   * Accepts both base64url — the DIV §4.4.2 wire form, which browsers and the gateway emit
-   * unpadded — and standard base64 (legacy receipts, older vectors), padded or not. The alphabets
-   * differ only in characters 62/63 ({@code +/} vs {@code -_}), so normalizing is lossless and
-   * cannot make an invalid encoding valid.
-   */
-  private static byte[] decodeBase64Flexible(String s) {
-    String normalized = s.replace('-', '+').replace('_', '/');
-    int rem = normalized.length() % 4;
-    if (rem != 0) {
-      normalized = normalized + "====".substring(rem);
-    }
-    return Base64.getDecoder().decode(normalized);
-  }
-
-  /** Removes trailing '=' so a padded challenge compares equal to the unpadded form. */
-  private static String stripBase64Padding(String s) {
-    int end = s == null ? 0 : s.length();
-    if (s == null) {
-      return "";
-    }
-    while (end > 0 && s.charAt(end - 1) == '=') {
-      end--;
-    }
-    return s.substring(0, end);
   }
 
   private static boolean isEmpty(String s) {
